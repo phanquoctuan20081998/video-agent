@@ -257,12 +257,12 @@ class VideoAgent:
                 return None
         session.edl_path = str(edl_path)
 
-        # ── Step 6a: Map/stat overlay graphics ───────────────────────────────
-        overlays_dir = work_dir / "animations"
-        if self._overlays_fresh(edl_path, overlays_dir):
-            self.logger.info("[agent] ✓ overlays (cached)")
-        else:
-            await self._add_overlays_to_edl(script, concept, edl_path, overlays_dir)
+        # ── Step 6a: Map/stat overlay graphics (DISABLED — text overlays look cheap)
+        # overlays_dir = work_dir / "animations"
+        # if self._overlays_fresh(edl_path, overlays_dir):
+        #     self.logger.info("[agent] ✓ overlays (cached)")
+        # else:
+        #     await self._add_overlays_to_edl(script, concept, edl_path, overlays_dir)
 
         # ── Step 6b: Optional effects ─────────────────────────────────────────
         if apply_effects:

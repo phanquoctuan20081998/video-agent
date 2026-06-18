@@ -482,7 +482,6 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
             "-filter_complex", filter_complex,
             "-map", "0:v", "-map", audio_map,
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
             str(voiced),
         ], "mix voiceover")
         current = voiced

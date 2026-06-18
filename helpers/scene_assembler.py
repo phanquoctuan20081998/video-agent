@@ -422,6 +422,61 @@ def _generate_hf_html(props: dict, duration_s: float) -> str:
 </html>"""
 
 
+def _ensure_english_query(query: str, narration: str = "") -> str:
+    """Translate non-English stock search queries to detailed English.
+    
+    Stock APIs (Pexels, Pixabay) only understand English.
+    Also enriches vague queries with more descriptive terms.
+    """
+    # Check if query contains non-ASCII (Vietnamese, Chinese, etc.)
+    has_non_ascii = any(ord(c) > 127 for c in query)
+    is_too_short = len(query.split()) < 3
+    
+    if not has_non_ascii and not is_too_short:
+        return query
+    
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        # No API key — do basic cleanup: strip non-ASCII, keep what we can
+        if has_non_ascii:
+            ascii_words = [w for w in query.split() if all(ord(c) < 128 for c in w)]
+            return " ".join(ascii_words) if ascii_words else "cinematic landscape"
+        return query
+    
+    try:
+        import httpx as _httpx
+        context = f"\nScene narration: {narration}" if narration else ""
+        resp = _httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "google/gemini-2.5-flash-lite",
+                "messages": [{"role": "user", "content": (
+                    f"Translate this stock video search query to English. "
+                    f"Make it specific and descriptive (4-6 words) for finding "
+                    f"the exact visual on Pexels/Pixabay. "
+                    f"Reply with ONLY the English search query, nothing else.\n\n"
+                    f"Query: {query}{context}"
+                )}],
+                "temperature": 0.3,
+                "max_tokens": 30,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            result = resp.json()["choices"][0]["message"]["content"].strip().strip('"\'')
+            if result and len(result) > 2:
+                print(f"[assembler] query translated: '{query}' → '{result}'", file=sys.stderr)
+                return result
+    except Exception as e:
+        print(f"[assembler] query translation failed: {e}", file=sys.stderr)
+    
+    return query
+
+
 def fetch_stock_clip(
     scene: dict,
     output: Path,
@@ -455,9 +510,12 @@ def fetch_stock_clip(
 
     query = props.get("query", props.get("caption", "nature"))
     duration_s = scene.get("duration_s", 6.0)
+    narration = scene.get("narration", "")
+
+    # Ensure query is in English and descriptive — stock APIs only understand English
+    query = _ensure_english_query(query, narration)
     
     # Diversity: if same query used before, augment with narration keywords
-    narration = scene.get("narration", "")
     if query in used_queries and narration:
         # Extract 1-2 unique keywords from narration to diversify
         stop_words = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to", "and", "for", "on", "with", "that", "this", "it", "from", "by", "as", "at", "or", "but", "not", "be", "have", "has", "had", "do", "does", "did", "will", "would", "can", "could", "should", "may", "might", "shall", "must", "các", "một", "của", "và", "là", "cho", "với", "này", "đó", "được", "có", "từ", "trong", "những", "đã", "sẽ", "để", "không"}
@@ -643,13 +701,19 @@ def mix_voiceover(video: Path, voiceover: Path, output: Path) -> Path:
     vo_dur = get_duration(str(voiceover))
     vid_dur = get_duration(str(video))
 
-    # Loop video if shorter than voiceover
+    # If video is shorter than voiceover, re-encode with stream_loop to fill
+    # the entire voiceover duration (not just freeze on last frame)
     if vid_dur < vo_dur - 0.5:
         looped = video.parent / "looped_video.mp4"
         run([
-            "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(video),
-            "-t", str(vo_dur), "-c", "copy", str(looped),
-        ], "loop video to match voiceover")
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", str(video),
+            "-t", str(vo_dur),
+            "-vf", "fps=30",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "-an",
+            str(looped),
+        ], f"loop video {vid_dur:.1f}s → {vo_dur:.1f}s to match voiceover")
         video = looped
 
     run([
@@ -658,7 +722,6 @@ def mix_voiceover(video: Path, voiceover: Path, output: Path) -> Path:
         "-filter_complex", "[1:a]volume=1.0[vo];[vo]aformat=fltp:44100:stereo[a]",
         "-map", "0:v", "-map", "[a]",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-shortest",
         str(output),
     ], "mix voiceover")
     return output
@@ -754,12 +817,13 @@ def assemble(storyboard: dict, voiceover_path: Path, output_path: Path) -> Path:
         print(f"[assembler] scene {i+1}/{len(scenes)} [{scene_type}] {scene_id}", file=sys.stderr)
 
         try:
-            if scene_type == "remotion":
-                render_remotion_scene(scene, raw_clip)
-            elif scene_type in ("pil", "pil_animation", "text_card"):
-                render_pil_scene(scene, raw_clip)
-            elif scene_type in ("hyperframes", "hf"):
-                render_hyperframes_scene(scene, raw_clip, work_dir)
+            if scene_type in ("remotion", "pil", "pil_animation", "text_card", "hyperframes", "hf"):
+                # Degrade text/animation scenes to stock footage
+                print(f"[assembler] degrading {scene_id} [{scene_type}] → broll_stock", file=sys.stderr)
+                scene["props"] = scene.get("props", {})
+                if not scene["props"].get("query"):
+                    scene["props"]["query"] = scene.get("narration", "cinematic landscape")[:60]
+                fetch_stock_clip(scene, raw_clip, downloads_dir, used_video_ids, used_queries)
             elif scene_type in ("broll_stock", "stock"):
                 fetch_stock_clip(scene, raw_clip, downloads_dir, used_video_ids, used_queries)
             elif scene_type in ("broll_ai_image", "ai_image"):
@@ -799,13 +863,6 @@ def assemble(storyboard: dict, voiceover_path: Path, output_path: Path) -> Path:
             if not raw_clip.exists() or raw_clip.stat().st_size < 1000:
                 print(f"[assembler] scene {scene_id} produced no output, skipping", file=sys.stderr)
                 continue
-
-            # Caption overlay for B-roll clips
-            caption = scene.get("props", {}).get("caption")
-            if scene_type in ("broll_stock", "stock", "broll_ai", "ai", "broll_ai_video") and caption:
-                captioned = work_dir / f"{scene_id}_captioned.mp4"
-                add_caption_overlay(raw_clip, caption, captioned)
-                raw_clip = captioned
 
             normalize_clip(raw_clip, norm_clip)
             rendered_clips.append(norm_clip)

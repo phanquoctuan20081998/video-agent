@@ -127,38 +127,37 @@ Topic: {input}
 
 Respond ONLY with valid JSON.""",
 
-    "generate_storyboard": """You are a video storyboard director for Vox-style explainer videos.
-Given a script and concept, break the narration into scenes and assign each scene a visual template.
+    "generate_storyboard": """You are a video storyboard director for cinematic explainer videos.
+Given a script and concept, break the narration into scenes. Use ONLY real footage (stock video or AI-generated visuals). No text overlays, no motion graphics, no animated cards.
 
-Available templates:
-- kinetic_text: Large animated words flying in. Props: text, accent_words[], font_size
-- title_card: Big title + subtitle slide. Props: title, subtitle
-- definition_card: Word definition reveal. Props: term, definition, etymology
-- stat_card: Animated number/stat. Props: value, label, context, prefix, suffix
-- quote_card: Styled quote with attribution. Props: quote, attribution, year
-- timeline: Horizontal timeline. Props: title, events[{{year,label,highlight}}], active_index
-- list_reveal: Items appear one by one. Props: title, items[], style(bullet|numbered|check)
-- split_comparison: Left vs right. Props: title, left_label, left_items[], right_label, right_items[]
-- quick_zoom: Ken Burns zoom on image. Props: image_url, caption, zoom_start, zoom_end
-- broll_stock: Stock video clip. Props: query (for video search), caption
-- broll_ai_image: AI image → Ken Burns zoom. CHEAP ($0.01). Props: prompt (image description), caption, zoom_start, zoom_end
-- broll_ai_video: Seedance video. VERY EXPENSIVE. MAX 5s per clip. MAX 2 clips per video. Only for fire, explosions, crowds, flowing water — motion impossible to fake with image+zoom. Props: prompt (cinematic video description), caption
+Available scene types (ONLY these three):
+- broll_stock: Real stock video footage. FREE. Props: query (English, 4-6 descriptive words), caption
+- broll_ai_image: AI-generated image with Ken Burns zoom. CHEAP ($0.01). Props: prompt (detailed cinematic image description), caption, zoom_start, zoom_end
+- broll_ai_video: AI-generated video clip. EXPENSIVE. MAX 5s per clip, MAX 2 per video. Only for scenes needing real motion (fire, water, crowds). Props: prompt (cinematic video description with motion), caption
 
-HARD BUDGET RULE — $1 total per video:
-- broll_ai_video: MAX 2 clips × 5s = $1.00. Do not exceed. If not essential, use broll_ai_image instead.
-- broll_ai_image: FREE (Together Flux). Use freely for any static or slow scene.
-- Remotion templates: FREE. Prefer these for 60%+ of scenes.
-- broll_stock: FREE. Use for generic B-roll (city, nature, people working).
+DO NOT use: kinetic_text, title_card, stat_card, definition_card, quote_card, timeline, list_reveal, split_comparison, fact_counter, map_highlight, or any Remotion template. These look cheap and amateurish.
 
-Priority order: remotion → broll_stock → broll_ai_image → broll_ai_video (last resort, max 2)
+BUDGET:
+- broll_stock: FREE. Use for 70%+ of scenes.
+- broll_ai_image: $0.01 each. Use when stock can't match the exact visual needed.
+- broll_ai_video: MAX 2 clips total. Only when motion is essential.
 
-Other rules:
+Priority: broll_stock → broll_ai_image → broll_ai_video (last resort, max 2)
+
+Stock search queries:
+- ALL query values MUST be in ENGLISH regardless of script language
+- Be SPECIFIC and DESCRIPTIVE (4-6 words): "busy tokyo crosswalk night rain" NOT "city street"
+- Describe the EXACT visual: subject + setting + action + mood
+- BAD: "technology", "nature", "city" (too vague)
+- GOOD: "scientist examining microscope laboratory", "misty mountain sunrise timelapse"
+- If script is non-English, TRANSLATE the concept to English for query, keep caption in original language
+
+Rules:
 - Each scene 3-8 seconds
 - Total duration matches script (~{duration}s)
-- First scene: kinetic_text or title_card (hook)
-- Last scene: kinetic_text or list_reveal (CTA)
 - Assign narration text to each scene so they add up to the full script
 - Set style.music_mood to one of: cinematic, upbeat, minimal, dramatic
+- Every scene must have real visuals (stock or AI), never plain text on screen
 
 Script:
 {input}
@@ -178,25 +177,24 @@ Return JSON:
   "scenes": [
     {{
       "id": "s001",
-      "type": "remotion",
-      "template": "kinetic_text",
+      "type": "broll_stock",
       "duration_s": 5.0,
       "narration": "exact narration text for this scene",
-      "props": {{"text": "...", "accent_words": []}}
+      "props": {{"query": "aerial city skyline golden hour", "caption": ""}}
     }},
     {{
       "id": "s002",
       "type": "broll_ai_image",
       "duration_s": 6.0,
       "narration": "narration for this scene",
-      "props": {{"prompt": "cinematic image description", "caption": "overlay text", "zoom_start": 1.02, "zoom_end": 1.18}}
+      "props": {{"prompt": "cinematic detailed image description", "caption": "", "zoom_start": 1.02, "zoom_end": 1.18}}
     }},
     {{
       "id": "s003",
       "type": "broll_ai_video",
-      "duration_s": 8.0,
-      "narration": "narration for motion scene (MUST need real video motion)",
-      "props": {{"prompt": "cinematic video description with motion", "caption": "overlay text"}}
+      "duration_s": 5.0,
+      "narration": "narration for motion scene",
+      "props": {{"prompt": "cinematic video with motion", "caption": ""}}
     }}
   ]
 }}
@@ -207,37 +205,29 @@ Respond ONLY with valid JSON.""",
 Build the most engaging hybrid storyboard from a script, using EDL timing and stock sources when useful.
 
 Goal:
-- Make a fast, information-dense geography/listicle explainer.
-- If the script/topic is Vietnamese or about a Vietnamese reference channel, write onscreen text in Vietnamese.
-- Mix motion graphics, map scenes, fact cards, stock clips, and AI images.
-- Do NOT make every scene stock footage. Use stock for realism, Remotion for clarity, AI images for hard-to-source geography visuals.
+- Make a cinematic, information-dense geography/listicle explainer using ONLY real footage.
+- Use stock video clips, AI-generated images, and AI-generated video. NO text overlays, NO motion graphics, NO animated cards.
+- Every scene must show real visuals — never plain text on screen.
 
-Available Remotion templates:
-- kinetic_text: Large animated hook words. Props: text, accent_words[], font_size
-- title_card: Big title + subtitle. Props: title, subtitle
-- map_highlight: Satellite/map-style country callout. Props: region, headline, subline, callouts[], marker_label
-- fact_counter: Numbered fact card. Props: fact_number, headline, detail, tag
-- definition_card: Props: term, definition, etymology
-- stat_card: Props: value, label, context, prefix, suffix
-- timeline: Props: title, events[{{year,label,highlight}}], active_index
-- list_reveal: Props: title, items[], style
-- split_comparison: Props: title, left_label, left_items[], right_label, right_items[]
-- quick_zoom: Props: image_url, caption, zoom_start, zoom_end
+Available scene types (ONLY these three):
+- broll_stock: Real stock video or EDL source. FREE. Props: query (MUST be English, 4-6 descriptive words), caption, source_url OR source
+- broll_ai_image: AI image + Ken Burns zoom. CHEAP. Props: prompt (detailed cinematic description), caption, zoom_start, zoom_end
+- broll_ai_video: AI-generated video, expensive. MAX 2 clips, max 5s each. Props: prompt, caption
 
-Other scene types:
-- broll_stock: Use real stock/EDL source. Props: query, caption, source_url OR source
-- broll_ai_image: AI image + Ken Burns. Props: prompt, caption, zoom_start, zoom_end
-- broll_ai_video: Seedance video, expensive. MAX 2 clips, max 5s each. Props: prompt, caption
+DO NOT use any Remotion templates: no kinetic_text, title_card, map_highlight, fact_counter, stat_card, definition_card, quote_card, timeline, list_reveal, split_comparison. These look cheap and amateurish.
+
+Stock search queries:
+- ALL query values MUST be in ENGLISH even when the script is in Vietnamese or another language
+- Be SPECIFIC: "crowded delhi street market spices" NOT "India market"
+- Describe the EXACT visual: subject + setting + action + detail
+- BAD: "landscape", "people", "building" (returns unrelated generic footage)
+- GOOD: "himalayan snow peaks aerial sunrise", "vietnamese floating market mekong river", "ancient temple angkor wat moss"
 
 Hard rules:
 - Each scene should be 3-7 seconds.
-- First 5 seconds must hook with kinetic_text, map_highlight, or title_card.
-- Use map_highlight or fact_counter at least 35% of scenes for geography/listicle topics.
-- Use broll_stock for scenes where the EDL/stock source clearly matches the narration.
+- Use broll_stock for 70%+ of scenes. Use broll_ai_image when stock can't match the visual.
 - When using EDL stock, set props.source to an existing key from context.stock_sources OR props.source_url to a direct URL.
 - Use broll_ai_video only for motion that cannot be faked by image+zoom, maximum 2 scenes.
-- Keep text punchy: headline max 9 words, detail max 16 words.
-- Avoid unverifiable claims unless they are in the script.
 - Scene narration texts must concatenate to the full script in order.
 - Total duration should be close to {duration}s, but voiceover will be the source of truth.
 
@@ -259,19 +249,17 @@ Return ONLY valid JSON:
   "scenes": [
     {{
       "id": "s001",
-      "type": "remotion",
-      "template": "map_highlight",
+      "type": "broll_stock",
       "duration_s": 5.0,
       "narration": "exact narration",
-      "props": {{"region":"Ấn Độ","headline":"Không chỉ là một quốc gia","subline":"Mà như một hành tinh riêng","callouts":["1.4 tỷ dân","sa mạc tới Himalaya"],"marker_label":"INDIA"}}
+      "props": {{"query": "india aerial landscape diverse terrain", "caption": ""}}
     }},
     {{
       "id": "s002",
-      "type": "remotion",
-      "template": "fact_counter",
+      "type": "broll_ai_image",
       "duration_s": 4.0,
       "narration": "exact narration",
-      "props": {{"fact_number":"01","headline":"Một lục địa thu nhỏ","detail":"Khí hậu thay đổi cực mạnh chỉ trong một quốc gia","tag":"ĐỊA LÝ"}}
+      "props": {{"prompt": "satellite view of Indian subcontinent showing climate zones from desert to snow mountains", "caption": "", "zoom_start": 1.0, "zoom_end": 1.15}}
     }},
     {{
       "id": "s003",
@@ -338,13 +326,16 @@ Given a video script, generate UNIQUE and DIVERSE search terms for each sentence
 Each search term should find visually DIFFERENT footage — avoid generic repetition.
 
 Rules:
+- ALL search terms MUST be in ENGLISH regardless of script language. Translate concepts to English.
 - One search term per script sentence (or logical segment if sentences are very short)
 - Each term must be VISUALLY DISTINCT from all others (different subject, location, action)
-- Include specific details: country names, landmarks, actions, objects
+- Use 4-6 DESCRIPTIVE words per search term — be specific about the exact visual
+- Include specific details: country names, landmarks, actions, objects, lighting, camera angle
+- BAD (too vague): "technology", "India", "nature", "people working"
+- GOOD (specific): "silicon valley office glass building", "rajasthan desert camel caravan sunset", "dense amazon rainforest canopy aerial", "japanese chef preparing sushi closeup"
 - Mix wide shots (aerial, landscape) with close-ups (hands, faces, objects)
 - For geography topics: alternate between map/satellite, street-level, people, nature, architecture
 - NEVER repeat the same base concept with just a different angle (e.g. "Africa aerial" and "Africa drone" are too similar)
-- Maximum 3 words per search term for best stock API results
 
 Topic/concept context:
 {context_section}
