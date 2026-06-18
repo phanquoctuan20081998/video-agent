@@ -9,3 +9,6 @@ logs/
 youtube_token.pickle
 youtube_oauth.json
 config/config.toml
+node_modules/
+.DS_Store
+remotion/.remotion/
