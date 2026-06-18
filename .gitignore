@@ -1,0 +1,11 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+outputs/
+temp/
+logs/
+youtube_token.pickle
+youtube_oauth.json
+config/config.toml

@@ -26,9 +26,10 @@ TASK_MODELS = {
     "generate_edl": "deepseek/deepseek-r1",
     "generate_storyboard": "deepseek/deepseek-r1",
     "generate_hybrid_storyboard": "deepseek/deepseek-r1",
-    "analyze_content": "google/gemini-flash-1.5",
+    "analyze_content": "google/gemini-2.5-flash-lite",
     "generate_seo": "meta-llama/llama-3.1-8b-instruct",
     "generate_concept": "meta-llama/llama-3.3-70b-instruct",
+    "generate_overlays": "google/gemini-2.5-flash-lite",
 }
 
 TASK_PROMPTS = {
@@ -43,9 +44,13 @@ Given a topic, generate a video concept as JSON with keys:
 
 Topic: {input}
 
-If the topic is Vietnamese or asks for a geography channel/style, prefer Vietnamese titles,
-fast geography/listicle structure, surprising facts, map-friendly beats, and thumbnail ideas
-with satellite maps, highlighted country shapes, big yellow-white text.
+Write the title/hook in the same language as the topic (do not force Vietnamese unless the
+topic itself is in Vietnamese).
+
+If the topic is geography/explainer/listicle style (country comparisons, "why does X happen",
+geographic facts), use fast-paced structure, surprising statistics, map-friendly beats designed
+for map/country-highlight overlays, and thumbnail ideas with satellite maps, highlighted country
+shapes, bold text.
 
 Respond ONLY with valid JSON.""",
 
@@ -77,10 +82,10 @@ Rules:
 - Prefer silence gaps ≥400ms for cuts
 - Label each range with a beat (HOOK, PROBLEM, SOLUTION, BENEFIT, EXAMPLE, CTA)
 - Include quote (verbatim words) and reason for each cut
-- CRITICAL: Each source may appear at most ONCE in ranges. Spread ranges evenly across ALL available sources.
-- Do NOT reuse the same source for multiple ranges — viewers will notice repeated footage.
+- Spread ranges evenly across ALL available sources before reusing any of them.
 - Assign sources in round-robin order (stock_0 for range 1, stock_1 for range 2, etc.)
-- If more ranges than sources, loop sources but ensure no two consecutive ranges share a source.
+- If there are more ranges than sources, looping back is fine — but never let two consecutive
+  ranges share the same source (viewers notice back-to-back repeats, not spaced-out repeats).
 
 Packed transcript:
 {input}
@@ -276,6 +281,43 @@ Return ONLY valid JSON:
   ]
 }}""",
 
+    "generate_overlays": """You are a motion graphics director for a YouTube geography/explainer video.
+Given a script and its concept, pick 4-10 moments that deserve an on-screen graphic overlay
+on top of the stock-footage edit.
+
+Use these two overlay types only:
+- map_highlight: script names a specific country/region/place. Props: region, headline, subline (optional), callouts (list of <=3 short strings, optional), marker_label (optional)
+- stat_card: script states a specific number/statistic/comparison. Props: value, label, context (optional), prefix (optional), suffix (optional)
+
+Rules:
+- Order the list by where each moment occurs in the script (earliest first).
+- position_fraction estimates how far through the script's runtime this moment occurs (0.0 = start, 1.0 = end).
+- duration_s between 4 and 6.
+- Don't invent statistics or facts not present in the script.
+- Skip this entirely (return []) if the script has no clear place names or stats to highlight.
+
+Concept context:
+{context_section}
+
+Script:
+{input}
+
+Return ONLY a valid JSON array:
+[
+  {{
+    "template": "map_highlight",
+    "position_fraction": 0.08,
+    "duration_s": 5,
+    "props": {{"region": "...", "headline": "...", "subline": "...", "callouts": ["...", "..."], "marker_label": "..."}}
+  }},
+  {{
+    "template": "stat_card",
+    "position_fraction": 0.34,
+    "duration_s": 5,
+    "props": {{"value": "60", "label": "percent of trade routes", "context": "...", "suffix": "%"}}
+  }}
+]""",
+
     "generate_seo": """You are a YouTube SEO expert.
 Given a video script, generate optimized metadata as JSON:
 - title: SEO-optimized title (max 70 chars, include main keyword)
@@ -376,7 +418,7 @@ def main():
 
     print(f"[llm_task] task={args.task} model={model}", file=sys.stderr)
 
-    json_tasks = {"generate_concept", "generate_edl", "generate_storyboard", "analyze_content", "generate_seo"}
+    json_tasks = {"generate_concept", "generate_edl", "generate_storyboard", "generate_hybrid_storyboard", "generate_overlays", "analyze_content", "generate_seo"}
     result = ""
     max_retries = 3
     for attempt in range(1, max_retries + 1):

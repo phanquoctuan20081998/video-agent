@@ -61,7 +61,7 @@ class VoiceoverGenerator:
                     or "Rachel"
                 )
             model_id = config.settings.elevenlabs_model_id or "eleven_multilingual_v2"
-            language_code = (config.settings.elevenlabs_language_code or "").split("-")[0]
+            language_code = (config.settings.elevenlabs_language_code or language or "").split("-")[0]
             
             headers = {
                 "xi-api-key": api_key,

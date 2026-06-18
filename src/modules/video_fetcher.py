@@ -1,12 +1,22 @@
 """
 Stock Video Fetcher Module
-Fetch videos from Pexels, Pixabay, Coverr
+Fetch videos from Pexels, Pixabay, Coverr, YouTube (Creative Commons only)
 """
 
+import re
 import httpx
 from typing import List, Optional
 from pydantic import BaseModel
 from loguru import logger
+
+
+def _parse_iso8601_duration(value: str) -> float:
+    """Parse ISO 8601 duration (e.g. PT1H2M3S) to seconds."""
+    match = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value or "")
+    if not match:
+        return 0.0
+    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+    return float(hours * 3600 + minutes * 60 + seconds)
 
 
 class StockVideo(BaseModel):
@@ -226,6 +236,88 @@ class StockVideoFetcher:
             self.logger.warning(f"Error fetching from Coverr: {e}")
             return []
     
+    async def search_youtube_cc(
+        self,
+        query: str,
+        max_results: int = 20
+    ) -> List[StockVideo]:
+        """Search YouTube for Creative Commons licensed videos only.
+
+        videoLicense=creativeCommon restricts results to clips explicitly
+        marked reusable. Do not remove that filter — without it, results
+        would be arbitrary copyrighted videos (ToS / copyright risk).
+        """
+        from src.core import config
+
+        api_key = config.settings.youtube_developer_key
+        if not api_key:
+            self.logger.warning("YouTube developer key not configured")
+            return []
+
+        try:
+            async with httpx.AsyncClient() as client:
+                search_resp = await client.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params={
+                        "key": api_key,
+                        "q": query,
+                        "part": "snippet",
+                        "type": "video",
+                        "videoLicense": "creativeCommon",
+                        "maxResults": max_results,
+                        "safeSearch": "strict",
+                    }
+                )
+                search_resp.raise_for_status()
+                items = search_resp.json().get("items", [])
+
+                video_ids = [item["id"]["videoId"] for item in items if item.get("id", {}).get("videoId")]
+                if not video_ids:
+                    self.logger.info(f"Found 0 Creative Commons videos on YouTube for: {query}")
+                    return []
+
+                details_resp = await client.get(
+                    "https://www.googleapis.com/youtube/v3/videos",
+                    params={
+                        "key": api_key,
+                        "id": ",".join(video_ids),
+                        "part": "contentDetails",
+                    }
+                )
+                details_resp.raise_for_status()
+                durations = {
+                    v["id"]: _parse_iso8601_duration(v.get("contentDetails", {}).get("duration", ""))
+                    for v in details_resp.json().get("items", [])
+                }
+
+            results = []
+            for item in items:
+                video_id = item.get("id", {}).get("videoId")
+                if not video_id:
+                    continue
+                snippet = item.get("snippet", {})
+                thumbnails = snippet.get("thumbnails", {})
+                stock_video = StockVideo(
+                    id=video_id,
+                    title=snippet.get("title", f"{query} - YouTube CC"),
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    preview_url=(thumbnails.get("high") or thumbnails.get("default") or {}).get("url"),
+                    download_url=f"https://www.youtube.com/watch?v={video_id}",
+                    duration=durations.get(video_id, 0.0),
+                    width=1920,
+                    height=1080,
+                    source="youtube_cc",
+                    tags=[query]
+                )
+                results.append(stock_video)
+
+            self.logger.info(f"Found {len(results)} Creative Commons videos on YouTube for: {query}")
+            return results
+
+        except Exception as e:
+            self.logger.warning(f"Error fetching from YouTube CC: {e}")
+            return []
+
     async def search_all_sources(
         self,
         query: str,
@@ -248,6 +340,8 @@ class StockVideoFetcher:
             tasks.append(self.search_pixabay(query, max_results_per_source))
         if "coverr" in sources:
             tasks.append(self.search_coverr(query, max_results_per_source))
+        if "youtube_cc" in sources or "youtube" in sources:
+            tasks.append(self.search_youtube_cc(query, max_results_per_source))
         
         results = []
         if not tasks:

@@ -144,8 +144,10 @@ class VideoAgent:
                 return None
 
         # ── Step 3: Stock videos ──────────────────────────────────────────────
-        # Use more varied keywords: topic keywords + generic visual keywords
-        concept_keywords = list(dict.fromkeys([*keywords, *concept.get("keywords", [topic])]))[:5]
+        # Use more varied keywords: topic keywords + generic visual keywords.
+        # Keyword/clip volume scales with duration so long-form videos don't
+        # starve on unique sources (EDL avoids back-to-back repeats per source).
+        concept_keywords = list(dict.fromkeys([*keywords, *concept.get("keywords", [topic])]))
         visual_keywords = [
             "satellite map",
             "world map animation",
@@ -155,9 +157,21 @@ class VideoAgent:
             "mountains river",
             "data visualization",
             "travel documentary",
+            "drone footage city",
+            "rural village life",
+            "industrial factory",
+            "ocean coastline",
+            "desert landscape",
+            "forest canopy",
+            "busy street crowd",
+            "infographic chart",
         ]
-        all_keywords = list(dict.fromkeys(concept_keywords + visual_keywords))[:8]
-        stock_videos = await self._fetch_stock_videos(all_keywords, work_dir)
+        keyword_pool = list(dict.fromkeys(concept_keywords + visual_keywords))
+        clips_per_keyword = 6
+        target_clips = max(8, math.ceil(duration / 6))
+        needed_keywords = min(max(8, math.ceil(target_clips / clips_per_keyword)), len(keyword_pool), 20)
+        all_keywords = keyword_pool[:needed_keywords]
+        stock_videos = await self._fetch_stock_videos(all_keywords, work_dir, max_per_keyword=clips_per_keyword)
 
         # ── Step 4: Voiceover ─────────────────────────────────────────────────
         voiceover_path = work_dir / "voiceover.mp3"
@@ -203,9 +217,24 @@ class VideoAgent:
                 return None
         session.edl_path = str(edl_path)
 
+        # ── Step 6a: Map/stat overlay graphics ───────────────────────────────
+        overlays_dir = work_dir / "animations"
+        if self._overlays_fresh(edl_path, overlays_dir):
+            self.logger.info("[agent] ✓ overlays (cached)")
+        else:
+            await self._add_overlays_to_edl(script, concept, edl_path, overlays_dir)
+
         # ── Step 6b: Optional effects ─────────────────────────────────────────
         if apply_effects:
             await self._generate_effects(concept, script, edl_path, work_dir, session, mode=effects_mode)
+
+        # ── Step 6c: Master subtitles (Rule 1/5/6/8) ──────────────────────────
+        # Runs after effects so it always has the final say on edl["subtitles"].
+        srt_path = work_dir / "master.srt"
+        if fresh(srt_path, [edl_path, voiceover_path], min_bytes=10):
+            self.logger.info("[agent] ✓ subtitles (cached)")
+        else:
+            self._attach_subtitles(edl_path, work_dir, srt_path)
 
         # ── Step 7: Render ────────────────────────────────────────────────────
         preview_path = work_dir / "preview.mp4"
@@ -730,6 +759,212 @@ class VideoAgent:
             self.logger.warning(f"[agent] EDL dedup failed (using as-is): {e}")
         return edl_path
 
+    async def _generate_overlay_specs(self, script: str, concept: dict, work_dir: Path) -> list[dict]:
+        """LLM call: pick script moments worth a map_highlight/stat_card graphic."""
+        script_path = work_dir / "script.txt"
+        concept_path = work_dir / "concept.json"
+        specs_path = work_dir / "overlay_specs.json"
+        if not script_path.exists():
+            script_path.write_text(script)
+        if not concept_path.exists():
+            concept_path.write_text(json.dumps(concept, indent=2))
+        self._run_helper([
+            "helpers/llm_task.py",
+            "--task", "generate_overlays",
+            "--input", str(script_path),
+            "--context", str(concept_path),
+            "--output", str(specs_path),
+        ], "generate overlay graphic specs")
+        if not specs_path.exists():
+            return []
+        try:
+            specs = json.loads(specs_path.read_text())
+        except json.JSONDecodeError:
+            self.logger.warning("[agent] overlay_specs.json invalid JSON, skipping overlays")
+            return []
+        return specs if isinstance(specs, list) else []
+
+    async def _render_overlays(self, specs: list[dict], total_duration_s: float, overlays_dir: Path) -> list[dict]:
+        """Render each overlay spec to MP4 via Remotion, in parallel (Rule 10)."""
+        overlays_dir.mkdir(parents=True, exist_ok=True)
+
+        async def render_one(i: int, spec: dict) -> Optional[dict]:
+            template = spec.get("template")
+            if template not in ("map_highlight", "stat_card"):
+                return None
+            props = dict(spec.get("props", {}))
+            duration_s = float(spec.get("duration_s", 5.0))
+            props["duration_s"] = duration_s
+            out_path = overlays_dir / f"overlay_{i}_{template}.mp4"
+            try:
+                await asyncio.to_thread(
+                    self._run_helper,
+                    [
+                        "helpers/remotion_runner.py",
+                        "--composition", template,
+                        "--props", json.dumps(props),
+                        "--output", str(out_path),
+                    ],
+                    f"render overlay {i} ({template})",
+                )
+            except RuntimeError as e:
+                self.logger.warning(f"[agent] overlay {i} render failed, skipping: {e}")
+                return None
+            if not out_path.exists():
+                return None
+            position_fraction = max(0.0, min(1.0, float(spec.get("position_fraction", 0.0))))
+            start = round(position_fraction * max(total_duration_s - duration_s, 0.0), 2)
+            return {"file": str(out_path.resolve()), "start_in_output": start, "duration": duration_s}
+
+        results = await asyncio.gather(*(render_one(i, s) for i, s in enumerate(specs)))
+        return [r for r in results if r]
+
+    def _overlays_fresh(self, edl_path: Path, overlays_dir: Path) -> bool:
+        manifest_path = overlays_dir / "manifest.json"
+        if not edl_path.exists() or not manifest_path.exists():
+            return False
+        if manifest_path.stat().st_mtime < edl_path.stat().st_mtime:
+            return False
+        try:
+            overlays = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        return all(Path(o["file"]).exists() for o in overlays)
+
+    async def _add_overlays_to_edl(self, script: str, concept: dict, edl_path: Path, overlays_dir: Path) -> None:
+        edl = json.loads(edl_path.read_text())
+        ranges = edl.get("ranges", [])
+        total_duration_s = edl.get("total_duration_s") or sum(
+            max(0.0, r.get("end", 0.0) - r.get("start", 0.0)) for r in ranges
+        )
+
+        manifest_path = overlays_dir / "manifest.json"
+        overlays_dir.mkdir(parents=True, exist_ok=True)
+
+        if total_duration_s <= 0:
+            self.logger.warning("[agent] EDL has no duration, skipping overlay graphics")
+            overlays = []
+        else:
+            specs = await self._generate_overlay_specs(script, concept, edl_path.parent)
+            if not specs:
+                self.logger.info("[agent] no overlay graphics needed for this script")
+                overlays = []
+            else:
+                overlays = await self._render_overlays(specs, total_duration_s, overlays_dir)
+                self.logger.info(f"[agent] added {len(overlays)} map/stat overlay graphics")
+
+        edl["overlays"] = overlays
+        edl_path.write_text(json.dumps(edl, indent=2))
+        manifest_path.write_text(json.dumps(overlays, indent=2))
+
+    def _attach_subtitles(self, edl_path: Path, work_dir: Path, srt_path: Path) -> None:
+        """Build master.srt from cached word-level transcripts and wire it into the EDL."""
+        edl = json.loads(edl_path.read_text())
+        built = self._build_master_srt(edl, work_dir)
+        if built:
+            edl["subtitles"] = str(built.resolve())
+            self.logger.info(f"[agent] master.srt built ({built.stat().st_size}B, {self._count_srt_cues(built)} cues)")
+        else:
+            edl["subtitles"] = None
+            self.logger.warning("[agent] could not build subtitles — no cached word-level transcript found")
+        edl_path.write_text(json.dumps(edl, indent=2))
+
+    def _build_master_srt(self, edl: dict, work_dir: Path) -> Optional[Path]:
+        """Rule 5: output-timeline offsets. Rule 6: snap to word boundaries.
+        Rule 8: word-level verbatim ASR only. Rule 9: reuse cached transcripts.
+
+        Workflow A lays a single continuous voiceover track under the cut
+        b-roll (render.py mixes it untouched, only the visual is looped/trimmed
+        to match) — so the voiceover's own source timestamps already ARE
+        output-timeline timestamps. Workflow B cuts ranges directly out of
+        footage whose own audio becomes the output, so each range must be
+        remapped from source time to cumulative output time.
+        """
+        transcripts_dir = work_dir / "transcripts"
+        ranges = edl.get("ranges", [])
+
+        voiceover_json = transcripts_dir / "voiceover.json"
+        if voiceover_json.exists():
+            words = self._load_transcript_words(voiceover_json)
+            cues = self._words_to_cues(words)
+        else:
+            cues = []
+            cumulative = 0.0
+            for r in ranges:
+                duration = max(0.0, r.get("end", 0.0) - r.get("start", 0.0))
+                source_json = transcripts_dir / f"{r.get('source')}.json"
+                if source_json.exists():
+                    words = self._load_transcript_words(source_json)
+                    in_range = [
+                        w for w in words
+                        if w["start"] >= r["start"] - 0.05 and w["end"] <= r["end"] + 0.05
+                    ]
+                    shifted = [
+                        {
+                            "text": w["text"],
+                            "start": cumulative + (w["start"] - r["start"]),
+                            "end": cumulative + (w["end"] - r["start"]),
+                        }
+                        for w in in_range
+                    ]
+                    cues.extend(self._words_to_cues(shifted))
+                cumulative += duration
+
+        if not cues:
+            return None
+
+        srt_path = work_dir / "master.srt"
+        srt_path.write_text(self._cues_to_srt(cues))
+        return srt_path
+
+    @staticmethod
+    def _load_transcript_words(path: Path) -> list[dict]:
+        data = json.loads(path.read_text())
+        return [w for w in data.get("words", []) if w.get("type") == "word"]
+
+    @staticmethod
+    def _words_to_cues(
+        words: list[dict],
+        max_words: int = 10,
+        max_dur: float = 4.5,
+        gap_break: float = 0.35,
+    ) -> list[tuple[float, float, str]]:
+        cues: list[tuple[float, float, str]] = []
+        bucket: list[dict] = []
+        for w in words:
+            if bucket:
+                gap = w["start"] - bucket[-1]["end"]
+                dur = w["end"] - bucket[0]["start"]
+                if gap >= gap_break or len(bucket) >= max_words or dur >= max_dur:
+                    cues.append((bucket[0]["start"], bucket[-1]["end"], " ".join(b["text"] for b in bucket)))
+                    bucket = []
+            bucket.append(w)
+        if bucket:
+            cues.append((bucket[0]["start"], bucket[-1]["end"], " ".join(b["text"] for b in bucket)))
+        return cues
+
+    @staticmethod
+    def _cues_to_srt(cues: list[tuple[float, float, str]]) -> str:
+        def fmt(t: float) -> str:
+            t = max(0.0, t)
+            h = int(t // 3600)
+            m = int((t % 3600) // 60)
+            s = int(t % 60)
+            ms = int(round((t - int(t)) * 1000))
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+        lines = []
+        for i, (start, end, text) in enumerate(cues, 1):
+            lines.append(str(i))
+            lines.append(f"{fmt(start)} --> {fmt(end)}")
+            lines.append(text)
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _count_srt_cues(srt_path: Path) -> int:
+        return srt_path.read_text().count(" --> ")
+
     async def _generate_seo(self, script: str, work_dir: Path) -> dict:
         script_path = work_dir / "script.txt"
         metadata_path = work_dir / "metadata.json"
@@ -832,7 +1067,8 @@ class VideoAgent:
         if generated:
             edl["effects_mode"] = "seedance"
             edl["ai_effects"] = generated
-            edl["overlays"] = []
+            # Keep non-effect overlays (e.g. map_highlight/stat_card from Step 6a) — don't clobber them.
+            edl["overlays"] = [o for o in (edl.get("overlays") or []) if o.get("style_version") != 3]
             edl_path.write_text(json.dumps(edl, indent=2))
             session.session_notes.append(f"Generated {len(generated)} Seedance b-roll/effect clips")
             self.logger.info(f"[agent] Seedance clips added: {len(generated)}")
@@ -1055,11 +1291,9 @@ Ranges:
         effects_dir.mkdir(parents=True, exist_ok=True)
 
         existing = edl.get("overlays") or []
-        if (
-            existing
-            and all(Path(o.get("file", "")).exists() for o in existing)
-            and all(o.get("style_version") == 3 for o in existing)
-        ):
+        existing_effects = [o for o in existing if o.get("style_version") == 3]
+        existing_other = [o for o in existing if o.get("style_version") != 3]
+        if existing_effects and all(Path(o.get("file", "")).exists() for o in existing_effects):
             self.logger.info("[agent] ✓ effects (cached)")
             return
 
@@ -1070,7 +1304,8 @@ Ranges:
         )
         plan = self._plan_cut_accents(ranges, total_duration)
 
-        overlays = []
+        # Keep non-effect overlays (e.g. map_highlight/stat_card from Step 6a) — don't clobber them.
+        overlays = list(existing_other)
         for i, effect in enumerate(plan[:5]):
             kind = str(effect.get("kind", "key_card"))
             start = max(0.0, float(effect.get("start_in_output", effect.get("start", 0.0))))
@@ -1459,7 +1694,7 @@ EDL ranges:
 
     # ── Private: Asset fetching ───────────────────────────────────────────────
 
-    async def _fetch_stock_videos(self, keywords: list[str], work_dir: Path) -> list:
+    async def _fetch_stock_videos(self, keywords: list[str], work_dir: Path, max_per_keyword: int = 5) -> list:
         self.logger.info(f"[agent] fetching stock videos: {keywords}")
         videos = []
         seen_ids: set = set()
@@ -1474,7 +1709,7 @@ EDL ranges:
                     if vid_id not in seen_ids:
                         seen_ids.add(vid_id)
                         unique.append(v)
-                videos.extend(unique[:5])  # up to 5 unique clips per keyword
+                videos.extend(unique[:max_per_keyword])
             except Exception as e:
                 self.logger.warning(f"[agent] stock fetch failed for '{kw}': {e}")
         self.logger.info(f"[agent] fetched {len(videos)} unique landscape stock clips")

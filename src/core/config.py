@@ -35,7 +35,7 @@ class AppSettings(BaseSettings):
     pexels_api_key: str = Field(default="", alias="PEXELS_API_KEY")
     pixabay_api_key: str = Field(default="", alias="PIXABAY_API_KEY")
     coverr_api_key: str = Field(default="", alias="COVERR_API_KEY")
-    stock_video_sources: str = Field(default="pexels,pixabay", alias="STOCK_VIDEO_SOURCES")
+    stock_video_sources: str = Field(default="pexels,pixabay,youtube_cc", alias="STOCK_VIDEO_SOURCES")
     enable_coverr: bool = Field(default=False, alias="ENABLE_COVERR")
     
     # Voice & Audio
@@ -43,7 +43,7 @@ class AppSettings(BaseSettings):
     tts_provider: str = Field(default="", alias="TTS_PROVIDER")
     voice_id: str = Field(default="Rachel", alias="VOICE_ID")
     elevenlabs_voice_id: str = Field(default="", alias="ELEVENLABS_VOICE_ID")
-    elevenlabs_model_id: str = Field(default="eleven_multilingual_v2", alias="ELEVENLABS_MODEL_ID")
+    elevenlabs_model_id: str = Field(default="eleven_flash_v2_5", alias="ELEVENLABS_MODEL_ID")
     elevenlabs_language_code: str = Field(default="", alias="ELEVENLABS_LANGUAGE_CODE")
     voice_language: str = Field(default="vi", alias="VOICE_LANGUAGE")
     

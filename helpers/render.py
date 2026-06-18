@@ -271,8 +271,12 @@ def add_overlay(
         (
             # Shift overlay PTS to start_in_output (Rule 4)
             f"[1:v]setpts=PTS-STARTPTS+{start_in_output}/TB,format=rgb24[ov];"
-            # Screen blend: black=transparent, bright=additive
-            f"[0:v][ov]blend=all_mode=screen:all_opacity=0.9:"
+            # Screen blend: black=transparent, bright=additive.
+            # NOTE: named "all_mode=screen:all_opacity=..." corrupts colors
+            # (verified: produces a pink/magenta tint even at opacity=1.0 —
+            # an ffmpeg blend-filter bug in this param path). The bare
+            # "screen" shorthand is the verified-clean equivalent.
+            f"[0:v][ov]blend=screen:"
             f"enable='between(t,{start_in_output},{end_t})'[vout]"
         ),
         "-map", "[vout]", "-map", "0:a?",
@@ -316,9 +320,26 @@ def download_source(url: str, dest: Path) -> Path:
         return dest
     if not url.startswith("http"):
         return Path(url)  # already local path
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if "youtube.com/watch" in url or "youtu.be/" in url:
+        # Watch-page URL has no direct media stream; needs yt-dlp extraction.
+        print(f"[render] downloading via yt-dlp: {url[:80]}...", file=sys.stderr)
+        import subprocess
+        try:
+            subprocess.run(
+                ["yt-dlp", "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]",
+                 "-o", str(dest), url],
+                check=True, capture_output=True, text=True, timeout=180,
+            )
+            print(f"[render] downloaded: {dest.name} ({dest.stat().st_size // 1024}KB)", file=sys.stderr)
+        except subprocess.CalledProcessError as e:
+            print(f"[render] yt-dlp download failed: {e.stderr[-500:]}", file=sys.stderr)
+        return dest
+
     print(f"[render] downloading: {url[:80]}...", file=sys.stderr)
     import urllib.request
-    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         req = urllib.request.Request(url, headers=headers)
@@ -351,7 +372,11 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
     local_sources = {}
     for name, url in sources.items():
         if url.startswith("http"):
-            ext = url.split("?")[0].rsplit(".", 1)[-1][:4] or "mp4"
+            if "youtube.com/watch" in url or "youtu.be/" in url:
+                ext = "mp4"
+            else:
+                stem = url.split("?")[0].rsplit(".", 1)[-1][:4]
+                ext = stem if stem.isalnum() else "mp4"
             dest = downloads_dir / f"{name}.{ext}"
             local_sources[name] = str(download_source(url, dest))
         else:
