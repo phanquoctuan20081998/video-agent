@@ -86,6 +86,8 @@ class VideoAgent:
         effects_mode: str = "seedance",
         confirm_strategy: bool = True,
         mode: str = "edl",
+        stop_at: Optional[str] = None,
+        batch_count: int = 1,
     ) -> Optional[str]:
         """
         Workflow A: topic → final.mp4 (+ optional YouTube upload).
@@ -96,7 +98,19 @@ class VideoAgent:
         mode="storyboard":
           1. Concept → script → voiceover → storyboard (LLM) → scene_assembler
              (Remotion + AI images + optional Seedance, $1 budget cap)
+
+        stop_at: stop pipeline at a specific step and return intermediate result.
+          Options: "concept", "script", "terms", "audio", "materials", "storyboard", "render", None (full)
+        
+        batch_count: generate N versions of the video, return the best one (by file size heuristic).
         """
+        if batch_count > 1:
+            return await self._batch_generate(
+                topic=topic, keywords=keywords, duration=duration,
+                auto_upload=auto_upload, apply_effects=apply_effects,
+                effects_mode=effects_mode, confirm_strategy=confirm_strategy,
+                mode=mode, stop_at=stop_at, batch_count=batch_count,
+            )
         work_dir = Path(config.settings.output_dir) / "edit"
         work_dir.mkdir(parents=True, exist_ok=True)
         session = VideoSession(topic=topic, work_dir=str(work_dir))
@@ -129,6 +143,10 @@ class VideoAgent:
             if not concept:
                 return None
 
+        if stop_at == "concept":
+            self.logger.info(f"[agent] stop_at=concept → {concept_path}")
+            return str(concept_path)
+
         if confirm_strategy:
             self._print_strategy(concept, duration)
 
@@ -143,35 +161,53 @@ class VideoAgent:
             if not script:
                 return None
 
-        # ── Step 3: Stock videos ──────────────────────────────────────────────
-        # Use more varied keywords: topic keywords + generic visual keywords.
-        # Keyword/clip volume scales with duration so long-form videos don't
-        # starve on unique sources (EDL avoids back-to-back repeats per source).
-        concept_keywords = list(dict.fromkeys([*keywords, *concept.get("keywords", [topic])]))
-        visual_keywords = [
-            "satellite map",
-            "world map animation",
-            "aerial landscape",
-            "city timelapse",
-            "people market",
-            "mountains river",
-            "data visualization",
-            "travel documentary",
-            "drone footage city",
-            "rural village life",
-            "industrial factory",
-            "ocean coastline",
-            "desert landscape",
-            "forest canopy",
-            "busy street crowd",
-            "infographic chart",
-        ]
-        keyword_pool = list(dict.fromkeys(concept_keywords + visual_keywords))
-        clips_per_keyword = 6
-        target_clips = max(8, math.ceil(duration / 6))
-        needed_keywords = min(max(8, math.ceil(target_clips / clips_per_keyword)), len(keyword_pool), 20)
-        all_keywords = keyword_pool[:needed_keywords]
-        stock_videos = await self._fetch_stock_videos(all_keywords, work_dir, max_per_keyword=clips_per_keyword)
+        if stop_at == "script":
+            self.logger.info(f"[agent] stop_at=script → {script_path}")
+            return str(script_path)
+
+        # ── Step 2b: Per-sentence search terms (audio-matched stock diversity) ──
+        search_terms_path = work_dir / "search_terms.json"
+        if done(search_terms_path):
+            self.logger.info("[agent] ✓ search terms (cached)")
+            per_sentence_terms = json.loads(search_terms_path.read_text())
+        else:
+            per_sentence_terms = await self._generate_search_terms(script, concept, work_dir)
+
+        if stop_at == "terms":
+            self.logger.info(f"[agent] stop_at=terms → {search_terms_path}")
+            return str(search_terms_path)
+
+        # ── Step 3: Stock videos (per-sentence keywords for diversity) ────────
+        # Use per-sentence terms as PRIMARY keywords (each unique)
+        # Fallback to concept keywords + generic visual keywords if per-sentence failed
+        if per_sentence_terms:
+            # Extract unique search terms from per-sentence analysis
+            sentence_keywords = list(dict.fromkeys(
+                item.get("search_term", "") for item in per_sentence_terms if item.get("search_term")
+            ))
+            # Supplement with concept keywords for coverage
+            concept_keywords = list(dict.fromkeys([*keywords, *concept.get("keywords", [topic])]))
+            all_keywords = list(dict.fromkeys(sentence_keywords + concept_keywords))[:25]
+        else:
+            concept_keywords = list(dict.fromkeys([*keywords, *concept.get("keywords", [topic])]))
+            visual_keywords = [
+                "satellite map", "world map animation", "aerial landscape",
+                "city timelapse", "people market", "mountains river",
+                "data visualization", "travel documentary", "drone footage city",
+                "rural village life", "industrial factory", "ocean coastline",
+                "desert landscape", "forest canopy", "busy street crowd",
+            ]
+            all_keywords = list(dict.fromkeys(concept_keywords + visual_keywords))[:20]
+
+        clips_per_keyword = 4
+        stock_videos = await self._fetch_stock_videos(
+            all_keywords, work_dir, max_per_keyword=clips_per_keyword,
+            topic_context=topic,
+        )
+
+        if stop_at == "materials":
+            self.logger.info(f"[agent] stop_at=materials → {len(stock_videos)} clips fetched")
+            return str(work_dir / "materials_fetched")
 
         # ── Step 4: Voiceover ─────────────────────────────────────────────────
         voiceover_path = work_dir / "voiceover.mp3"
@@ -182,6 +218,10 @@ class VideoAgent:
             if not result:
                 return None
             voiceover_path = result
+
+        if stop_at == "audio":
+            self.logger.info(f"[agent] stop_at=audio → {voiceover_path}")
+            return str(voiceover_path)
 
         # ── Step 5: Transcribe + pack ─────────────────────────────────────────
         packed_md = work_dir / "takes_packed.md"
@@ -247,6 +287,10 @@ class VideoAgent:
             self._render(edl_path, preview_path)
             self._write_render_fingerprint(preview_path, [edl_path, voiceover_path])
         session.preview_path = str(preview_path)
+
+        if stop_at == "render":
+            self.logger.info(f"[agent] stop_at=render → {preview_path}")
+            return str(preview_path)
 
         # ── Step 8: Self-evaluate ─────────────────────────────────────────────
         final_path = work_dir / "final.mp4"
@@ -689,6 +733,127 @@ class VideoAgent:
         script_path.write_text(script)
         session.script = script
         return script
+
+    async def _generate_search_terms(
+        self, script: str, concept: dict, work_dir: Path
+    ) -> list[dict]:
+        """Generate per-sentence search terms for diverse stock footage."""
+        script_path = work_dir / "script.txt"
+        concept_path = work_dir / "concept.json"
+        terms_path = work_dir / "search_terms.json"
+
+        if not script_path.exists():
+            script_path.write_text(script)
+        if not concept_path.exists():
+            concept_path.write_text(json.dumps(concept, indent=2, ensure_ascii=False))
+
+        try:
+            self._run_helper([
+                "helpers/llm_task.py",
+                "--task", "generate_search_terms",
+                "--input", str(script_path),
+                "--context", str(concept_path),
+                "--output", str(terms_path),
+            ], "generate per-sentence search terms")
+        except RuntimeError as e:
+            self.logger.warning(f"[agent] search terms generation failed: {e}")
+            return []
+
+        if not terms_path.exists():
+            return []
+
+        try:
+            terms = json.loads(terms_path.read_text())
+            if isinstance(terms, list):
+                self.logger.info(f"[agent] generated {len(terms)} per-sentence search terms")
+                return terms
+        except json.JSONDecodeError:
+            self.logger.warning("[agent] search_terms.json invalid")
+        return []
+
+    async def _batch_generate(
+        self,
+        topic: str,
+        keywords: Optional[list[str]],
+        duration: float,
+        auto_upload: bool,
+        apply_effects: bool,
+        effects_mode: str,
+        confirm_strategy: bool,
+        mode: str,
+        stop_at: Optional[str],
+        batch_count: int,
+    ) -> Optional[str]:
+        """Generate N versions of the video, pick the best by file size + duration match."""
+        import shutil
+
+        self.logger.info(f"[agent] batch mode: generating {batch_count} versions")
+        base_work_dir = Path(config.settings.output_dir) / "edit"
+        results: list[tuple[str, int]] = []  # (path, score)
+
+        for i in range(batch_count):
+            batch_dir = base_work_dir / f"batch_{i}"
+            batch_dir.mkdir(parents=True, exist_ok=True)
+
+            # Temporarily override output dir for this batch
+            original_output = config.settings.output_dir
+            config.settings.output_dir = str(batch_dir.parent.parent)
+
+            # Clear caches that should differ between batches
+            # (stock videos, storyboard — keep concept and script shared)
+            for cache_file in ["search_terms.json", "storyboard.json", "edl.json"]:
+                (batch_dir / cache_file).unlink(missing_ok=True)
+
+            # Copy shared artifacts (concept, script, voiceover) to save LLM/TTS calls
+            for shared in ["concept.json", "script.txt", "voiceover.mp3"]:
+                src = base_work_dir / shared
+                dst = batch_dir / shared
+                if src.exists() and not dst.exists():
+                    shutil.copy2(str(src), str(dst))
+
+            try:
+                # Generate with batch_count=1 to avoid recursion
+                result = await self.generate_video(
+                    topic=topic, keywords=keywords, duration=duration,
+                    auto_upload=False, apply_effects=apply_effects,
+                    effects_mode=effects_mode, confirm_strategy=(confirm_strategy and i == 0),
+                    mode=mode, stop_at=stop_at, batch_count=1,
+                )
+                if result:
+                    path = Path(result)
+                    if path.exists():
+                        # Score: prefer larger files (more content) close to target duration
+                        size_score = path.stat().st_size
+                        results.append((str(path), size_score))
+                        self.logger.info(f"[agent] batch {i+1}/{batch_count}: {path.name} ({size_score // 1024}KB)")
+            except Exception as e:
+                self.logger.warning(f"[agent] batch {i+1} failed: {e}")
+            finally:
+                config.settings.output_dir = original_output
+
+        if not results:
+            self.logger.error("[agent] all batch attempts failed")
+            return None
+
+        # Pick best (highest score = largest file with most content)
+        results.sort(key=lambda x: x[1], reverse=True)
+        best_path = results[0][0]
+        self.logger.info(
+            f"[agent] batch winner: {Path(best_path).name} "
+            f"({results[0][1] // 1024}KB, best of {len(results)})"
+        )
+
+        # Copy winner to final location
+        final_path = base_work_dir / "final.mp4"
+        shutil.copy2(best_path, str(final_path))
+
+        if auto_upload:
+            script_path = base_work_dir / "script.txt"
+            script = script_path.read_text() if script_path.exists() else topic
+            metadata = await self._generate_seo(script, base_work_dir)
+            await self._upload(final_path, metadata)
+
+        return str(final_path)
 
     async def _generate_edl(
         self,
@@ -1694,13 +1859,15 @@ EDL ranges:
 
     # ── Private: Asset fetching ───────────────────────────────────────────────
 
-    async def _fetch_stock_videos(self, keywords: list[str], work_dir: Path, max_per_keyword: int = 5) -> list:
-        self.logger.info(f"[agent] fetching stock videos: {keywords}")
+    async def _fetch_stock_videos(self, keywords: list[str], work_dir: Path, max_per_keyword: int = 5, topic_context: Optional[str] = None) -> list:
+        self.logger.info(f"[agent] fetching stock videos: {len(keywords)} keywords")
         videos = []
         seen_ids: set = set()
         for kw in keywords:
             try:
-                results = await self.video_fetcher.search_all_sources(kw, max_results_per_source=10)
+                results = await self.video_fetcher.search_all_sources(
+                    kw, max_results_per_source=10, topic_context=topic_context
+                )
                 landscape = [v for v in results if v.width >= v.height]
                 # Deduplicate by URL to prevent same clip under different keywords
                 unique = []

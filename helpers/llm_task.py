@@ -30,6 +30,8 @@ TASK_MODELS = {
     "generate_seo": "meta-llama/llama-3.1-8b-instruct",
     "generate_concept": "meta-llama/llama-3.3-70b-instruct",
     "generate_overlays": "google/gemini-2.5-flash-lite",
+    "verify_stock_relevance": "google/gemini-2.5-flash-lite",
+    "generate_search_terms": "google/gemini-2.5-flash-lite",
 }
 
 TASK_PROMPTS = {
@@ -330,6 +332,32 @@ Script:
 {input}
 
 Respond ONLY with valid JSON.""",
+
+    "generate_search_terms": """You are a stock footage research specialist.
+Given a video script, generate UNIQUE and DIVERSE search terms for each sentence/segment.
+Each search term should find visually DIFFERENT footage — avoid generic repetition.
+
+Rules:
+- One search term per script sentence (or logical segment if sentences are very short)
+- Each term must be VISUALLY DISTINCT from all others (different subject, location, action)
+- Include specific details: country names, landmarks, actions, objects
+- Mix wide shots (aerial, landscape) with close-ups (hands, faces, objects)
+- For geography topics: alternate between map/satellite, street-level, people, nature, architecture
+- NEVER repeat the same base concept with just a different angle (e.g. "Africa aerial" and "Africa drone" are too similar)
+- Maximum 3 words per search term for best stock API results
+
+Topic/concept context:
+{context_section}
+
+Script:
+{input}
+
+Return ONLY a valid JSON array of objects:
+[
+  {{"sentence": "first sentence of script...", "search_term": "sahara sand dunes"}},
+  {{"sentence": "second sentence...", "search_term": "cairo bustling market"}},
+  {{"sentence": "third sentence...", "search_term": "nile river boat"}}
+]""",
 }
 
 
@@ -351,6 +379,38 @@ def call_openrouter(model: str, prompt: str, api_key: str) -> str:
         headers=headers,
         json=payload,
         timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def call_openrouter_vision(model: str, prompt: str, image_url: str, api_key: str) -> str:
+    """Call OpenRouter with a vision model, sending an image URL for analysis."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "https://github.com/video-agent",
+        "X-Title": "Video Agent",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        "temperature": 0.0,
+        "max_tokens": 200,
+    }
+    resp = httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=30,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
@@ -418,7 +478,7 @@ def main():
 
     print(f"[llm_task] task={args.task} model={model}", file=sys.stderr)
 
-    json_tasks = {"generate_concept", "generate_edl", "generate_storyboard", "generate_hybrid_storyboard", "generate_overlays", "analyze_content", "generate_seo"}
+    json_tasks = {"generate_concept", "generate_edl", "generate_storyboard", "generate_hybrid_storyboard", "generate_overlays", "analyze_content", "generate_seo", "generate_search_terms"}
     result = ""
     max_retries = 3
     for attempt in range(1, max_retries + 1):

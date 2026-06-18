@@ -35,6 +35,7 @@ class AppSettings(BaseSettings):
     pexels_api_key: str = Field(default="", alias="PEXELS_API_KEY")
     pixabay_api_key: str = Field(default="", alias="PIXABAY_API_KEY")
     coverr_api_key: str = Field(default="", alias="COVERR_API_KEY")
+    unsplash_api_key: str = Field(default="", alias="UNSPLASH_API_KEY")
     stock_video_sources: str = Field(default="pexels,pixabay,youtube_cc", alias="STOCK_VIDEO_SOURCES")
     enable_coverr: bool = Field(default=False, alias="ENABLE_COVERR")
     

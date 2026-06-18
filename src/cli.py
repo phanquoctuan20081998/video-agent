@@ -62,10 +62,23 @@ def cli():
     help="Pipeline mode: edl (stock footage + effects), hybrid, or storyboard"
 )
 @click.option(
+    "--stop-at",
+    type=click.Choice(["concept", "script", "terms", "audio", "materials", "storyboard", "render"]),
+    default=None,
+    help="Stop pipeline at this step and return intermediate result"
+)
+@click.option(
+    "--batch",
+    "-b",
+    default=1,
+    type=int,
+    help="Generate N versions and pick the best (default: 1)"
+)
+@click.option(
     "--title",
     help="Custom title for YouTube upload"
 )
-def generate(topic, keywords, duration, upload, effects, effects_mode, mode, title):
+def generate(topic, keywords, duration, upload, effects, effects_mode, mode, stop_at, batch, title):
     """Generate a video from topic"""
     try:
         # Initialize config and create directories
@@ -100,6 +113,8 @@ def generate(topic, keywords, duration, upload, effects, effects_mode, mode, tit
                     apply_effects=effects,
                     effects_mode=effects_mode,
                     mode=mode,
+                    stop_at=stop_at,
+                    batch_count=batch,
                 )
                 
                 if video_path:

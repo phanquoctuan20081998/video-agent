@@ -3,6 +3,8 @@ Stock Video Fetcher Module
 Fetch videos from Pexels, Pixabay, Coverr, YouTube (Creative Commons only)
 """
 
+import asyncio
+import os
 import re
 import httpx
 from typing import List, Optional
@@ -27,6 +29,19 @@ class StockVideo(BaseModel):
     preview_url: Optional[str] = None
     download_url: str
     duration: float
+    width: int
+    height: int
+    source: str
+    tags: list[str]
+
+
+class StockImage(BaseModel):
+    """Stock image item"""
+    id: str
+    title: str
+    url: str
+    preview_url: Optional[str] = None
+    download_url: str
     width: int
     height: int
     source: str
@@ -318,12 +333,89 @@ class StockVideoFetcher:
             self.logger.warning(f"Error fetching from YouTube CC: {e}")
             return []
 
+    async def filter_by_relevance(
+        self,
+        videos: List[StockVideo],
+        topic_context: str,
+        concurrency: int = 5,
+    ) -> List[StockVideo]:
+        """Filter stock videos by semantic relevance using a cheap vision model.
+        
+        Sends each video's preview thumbnail to a vision model and asks whether
+        the image content matches the topic. Rejects mismatches (e.g. Vietnam
+        footage when topic is Africa).
+        """
+        from helpers.llm_task import call_openrouter_vision, TASK_MODELS
+
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            self.logger.warning("OPENROUTER_API_KEY not set; skipping semantic filter")
+            return videos
+
+        model = TASK_MODELS["verify_stock_relevance"]
+
+        prompt = (
+            "You are a strict visual relevance checker for stock video selection.\n"
+            f"The video topic/concept is: \"{topic_context}\"\n\n"
+            "Look at this thumbnail image. Does it visually match or plausibly relate "
+            "to the topic above? Consider geography, culture, setting, objects, and people.\n\n"
+            "REJECT if:\n"
+            "- Wrong country/continent (e.g. Asian city when topic is African geography)\n"
+            "- Completely unrelated subject matter\n"
+            "- Culturally mismatched (wrong architecture, wrong ethnicity for region-specific topic)\n\n"
+            "ACCEPT if:\n"
+            "- Visually matches topic's geography/subject\n"
+            "- Generic enough to work (e.g. generic ocean for any coastal topic)\n"
+            "- Partially relevant (some elements match)\n\n"
+            "Respond with ONLY one word: ACCEPT or REJECT"
+        )
+
+        sem = asyncio.Semaphore(concurrency)
+        
+        async def check_one(video: StockVideo) -> tuple[StockVideo, bool]:
+            if not video.preview_url:
+                return (video, True)  # no thumbnail → keep by default
+            async with sem:
+                try:
+                    result = await asyncio.to_thread(
+                        call_openrouter_vision, model, prompt, video.preview_url, api_key
+                    )
+                    accepted = "ACCEPT" in result.upper()
+                    if not accepted:
+                        self.logger.info(
+                            f"[semantic_filter] REJECTED: {video.title} "
+                            f"(id={video.id}, source={video.source})"
+                        )
+                    return (video, accepted)
+                except Exception as e:
+                    self.logger.warning(f"[semantic_filter] error checking {video.id}: {e}")
+                    return (video, True)  # on error → keep (fail-open)
+
+        tasks = [check_one(v) for v in videos]
+        results = await asyncio.gather(*tasks)
+        
+        accepted = [v for v, ok in results if ok]
+        rejected_count = len(videos) - len(accepted)
+        self.logger.info(
+            f"[semantic_filter] {len(accepted)} accepted, {rejected_count} rejected "
+            f"out of {len(videos)} candidates for topic: {topic_context[:80]}"
+        )
+        return accepted
+
     async def search_all_sources(
         self,
         query: str,
-        max_results_per_source: int = 10
+        max_results_per_source: int = 10,
+        topic_context: Optional[str] = None
     ) -> List[StockVideo]:
-        """Search all configured stock video sources"""
+        """Search all configured stock video sources.
+        
+        Args:
+            query: search keywords
+            max_results_per_source: max results per source
+            topic_context: full topic/concept description for semantic filtering.
+                           If provided, filters results via vision model.
+        """
         import asyncio
         from src.core import config
 
@@ -360,4 +452,271 @@ class StockVideoFetcher:
                 seen_urls.add(video.download_url)
                 unique_results.append(video)
         
-        return unique_results[:max_results_per_source * max(1, len(sources))]
+        candidates = unique_results[:max_results_per_source * max(1, len(sources))]
+
+        # Semantic relevance filter via vision model
+        if topic_context and candidates:
+            candidates = await self.filter_by_relevance(candidates, topic_context)
+
+        return candidates
+
+    # ─── Image Search Methods ─────────────────────────────────────────────
+
+    async def search_pexels_images(
+        self,
+        query: str,
+        max_results: int = 15,
+        orientation: str = "landscape",
+    ) -> List[StockImage]:
+        """Search Pexels for stock images."""
+        from src.core import config
+
+        api_key = config.settings.pexels_api_key
+        if not api_key:
+            self.logger.warning("Pexels API key not configured")
+            return []
+
+        try:
+            headers = {"Authorization": api_key}
+            params = {
+                "query": query,
+                "per_page": max_results,
+                "orientation": orientation,
+            }
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.pexels.com/v1/search",
+                    headers=headers,
+                    params=params,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            results = []
+            for photo in data.get("photos", []):
+                src = photo.get("src", {})
+                results.append(StockImage(
+                    id=str(photo["id"]),
+                    title=photo.get("alt") or f"{query} - Pexels",
+                    url=photo.get("url", ""),
+                    preview_url=src.get("medium", ""),
+                    download_url=src.get("original", src.get("large2x", "")),
+                    width=photo.get("width", 1920),
+                    height=photo.get("height", 1080),
+                    source="pexels",
+                    tags=[query],
+                ))
+            self.logger.info(f"Found {len(results)} images on Pexels for: {query}")
+            return results
+        except Exception as e:
+            self.logger.warning(f"Error fetching images from Pexels: {e}")
+            return []
+
+    async def search_pixabay_images(
+        self,
+        query: str,
+        max_results: int = 15,
+        orientation: str = "horizontal",
+    ) -> List[StockImage]:
+        """Search Pixabay for stock images."""
+        from src.core import config
+
+        api_key = config.settings.pixabay_api_key
+        if not api_key:
+            self.logger.warning("Pixabay API key not configured")
+            return []
+
+        try:
+            params = {
+                "key": api_key,
+                "q": query,
+                "per_page": max(3, max_results),
+                "image_type": "photo",
+                "orientation": orientation,
+                "order": "popular",
+            }
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://pixabay.com/api/",
+                    params=params,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            results = []
+            for hit in data.get("hits", []):
+                results.append(StockImage(
+                    id=str(hit["id"]),
+                    title=hit.get("tags", query),
+                    url=hit.get("pageURL", ""),
+                    preview_url=hit.get("webformatURL", ""),
+                    download_url=hit.get("largeImageURL", hit.get("webformatURL", "")),
+                    width=hit.get("imageWidth", 1920),
+                    height=hit.get("imageHeight", 1080),
+                    source="pixabay",
+                    tags=[query] + (hit.get("tags", "").split(", ")[:5]),
+                ))
+            self.logger.info(f"Found {len(results)} images on Pixabay for: {query}")
+            return results
+        except Exception as e:
+            self.logger.warning(f"Error fetching images from Pixabay: {e}")
+            return []
+
+    async def search_unsplash_images(
+        self,
+        query: str,
+        max_results: int = 15,
+        orientation: str = "landscape",
+    ) -> List[StockImage]:
+        """Search Unsplash for stock images."""
+        from src.core import config
+
+        api_key = getattr(config.settings, "unsplash_api_key", "") or os.getenv("UNSPLASH_API_KEY", "")
+        if not api_key:
+            self.logger.debug("Unsplash API key not configured; skipping")
+            return []
+
+        try:
+            headers = {"Authorization": f"Client-ID {api_key}"}
+            params = {
+                "query": query,
+                "per_page": max_results,
+                "orientation": orientation,
+            }
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.unsplash.com/search/photos",
+                    headers=headers,
+                    params=params,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            results = []
+            for photo in data.get("results", []):
+                urls = photo.get("urls", {})
+                results.append(StockImage(
+                    id=photo["id"],
+                    title=photo.get("alt_description") or photo.get("description") or f"{query} - Unsplash",
+                    url=photo.get("links", {}).get("html", ""),
+                    preview_url=urls.get("small", ""),
+                    download_url=urls.get("full", urls.get("regular", "")),
+                    width=photo.get("width", 1920),
+                    height=photo.get("height", 1080),
+                    source="unsplash",
+                    tags=[query] + [t["title"] for t in photo.get("tags", [])[:5] if "title" in t],
+                ))
+            self.logger.info(f"Found {len(results)} images on Unsplash for: {query}")
+            return results
+        except Exception as e:
+            self.logger.warning(f"Error fetching images from Unsplash: {e}")
+            return []
+
+    async def filter_images_by_relevance(
+        self,
+        images: List[StockImage],
+        topic_context: str,
+        concurrency: int = 5,
+    ) -> List[StockImage]:
+        """Filter stock images by semantic relevance using vision model."""
+        from helpers.llm_task import call_openrouter_vision, TASK_MODELS
+
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            self.logger.warning("OPENROUTER_API_KEY not set; skipping image semantic filter")
+            return images
+
+        model = TASK_MODELS["verify_stock_relevance"]
+
+        prompt = (
+            "You are a strict visual relevance checker for stock image selection.\n"
+            f"The video topic/concept is: \"{topic_context}\"\n\n"
+            "Look at this image. Does it visually match or plausibly relate "
+            "to the topic above? Consider geography, culture, setting, objects, and people.\n\n"
+            "REJECT if:\n"
+            "- Wrong country/continent (e.g. Asian city when topic is African geography)\n"
+            "- Completely unrelated subject matter\n"
+            "- Culturally mismatched (wrong architecture, wrong ethnicity for region-specific topic)\n\n"
+            "ACCEPT if:\n"
+            "- Visually matches topic's geography/subject\n"
+            "- Generic enough to work (e.g. generic ocean for any coastal topic)\n"
+            "- Partially relevant (some elements match)\n\n"
+            "Respond with ONLY one word: ACCEPT or REJECT"
+        )
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def check_one(img: StockImage) -> tuple[StockImage, bool]:
+            preview = img.preview_url or img.download_url
+            if not preview:
+                return (img, True)
+            async with sem:
+                try:
+                    result = await asyncio.to_thread(
+                        call_openrouter_vision, model, prompt, preview, api_key
+                    )
+                    accepted = "ACCEPT" in result.upper()
+                    if not accepted:
+                        self.logger.info(
+                            f"[semantic_filter:img] REJECTED: {img.title} "
+                            f"(id={img.id}, source={img.source})"
+                        )
+                    return (img, accepted)
+                except Exception as e:
+                    self.logger.warning(f"[semantic_filter:img] error {img.id}: {e}")
+                    return (img, True)
+
+        tasks = [check_one(i) for i in images]
+        results = await asyncio.gather(*tasks)
+
+        accepted = [i for i, ok in results if ok]
+        rejected_count = len(images) - len(accepted)
+        self.logger.info(
+            f"[semantic_filter:img] {len(accepted)} accepted, {rejected_count} rejected "
+            f"out of {len(images)} image candidates"
+        )
+        return accepted
+
+    async def search_all_images(
+        self,
+        query: str,
+        max_results_per_source: int = 10,
+        topic_context: Optional[str] = None,
+        orientation: str = "landscape",
+    ) -> List[StockImage]:
+        """Search all configured image sources (Pexels, Pixabay, Unsplash).
+        
+        Args:
+            query: search keywords
+            max_results_per_source: max per source
+            topic_context: if provided, runs semantic filter
+            orientation: landscape / portrait / squarish
+        """
+        tasks = [
+            self.search_pexels_images(query, max_results_per_source, orientation),
+            self.search_pixabay_images(
+                query, max_results_per_source,
+                "horizontal" if orientation == "landscape" else "vertical"
+            ),
+            self.search_unsplash_images(query, max_results_per_source, orientation),
+        ]
+
+        results = []
+        for task_results in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(task_results, list):
+                results.extend(task_results)
+
+        # Deduplicate by download URL
+        seen = set()
+        unique = []
+        for img in results:
+            if img.download_url not in seen:
+                seen.add(img.download_url)
+                unique.append(img)
+
+        candidates = unique[:max_results_per_source * 3]
+
+        if topic_context and candidates:
+            candidates = await self.filter_images_by_relevance(candidates, topic_context)
+
+        return candidates
