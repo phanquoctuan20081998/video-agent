@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  video-agent:
+    build: .
+    container_name: video-agent
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - YOUTUBE_DEVELOPER_KEY=${YOUTUBE_DEVELOPER_KEY}
+      - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - PIXABAY_API_KEY=${PIXABAY_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./outputs:/app/outputs
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+      - ./config/config.toml:/app/config/config.toml
+    stdin_open: true
+    tty: true
+    # Uncomment for API server (future feature)
+    # ports:
+    #   - "8000:8000"

@@ -1,0 +1,69 @@
+[llm]
+provider = "openrouter"
+api_key = "your_openrouter_api_key"
+model = "bytedance/seedance-2.0"
+temperature = 0.7
+max_tokens = 4000
+
+[video]
+output_format = "mp4"
+video_codec = "libx264"
+audio_codec = "aac"
+bitrate = "3000k"
+frame_rate = 30
+resolution_portrait = "1080x1920"
+resolution_landscape = "1920x1080"
+
+[stock_videos]
+pexels_api_key = ""
+pixabay_api_key = ""
+coverr_api_key = ""
+preferred_sources = ["pexels", "pixabay"]
+# Coverr uses https://public-api.coverr.co/videos with x-api-key auth.
+# Enable only if COVERR_API_KEY is valid.
+
+[youtube]
+client_id = ""
+client_secret = ""
+developer_key = ""
+upload_auto = false
+channel_id = ""
+playlist_category = 22
+
+[audio]
+tts_provider = "edge_tts"
+voice_id = "Rachel"
+elevenlabs_model_id = "eleven_multilingual_v2"
+sample_rate = 44100
+bit_depth = 16
+language = "vi"
+
+[subtitles]
+provider = "whisper"
+model_size = "large-v3-turbo"
+font_size = 30
+font_path = "/System/Library/Fonts/Arial.ttf"
+text_color = "#FFFFFF"
+bg_color = "#000000"
+position = "bottom"
+
+[editing]
+auto_cut_silence = true
+silence_threshold = -40
+min_silence_duration = 0.5
+add_transitions = true
+color_grade_mode = "warm_cinematic"
+
+[search]
+search_engine = "google"
+trending_source = "youtube_trending"
+max_results = 10
+exclude_keywords = []
+include_keywords = []
+
+[processing]
+batch_size = 5
+max_concurrent_jobs = 3
+gpu_enabled = false
+temp_dir = "./temp"
+cleanup_temp = true
