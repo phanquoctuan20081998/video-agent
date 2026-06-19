@@ -102,6 +102,19 @@ STYLE RULES:
 - Avoid fearmongering, over-dramatic doom language, corporate wording, stiff textbook phrasing.
 - End with only a soft, short CTA asking viewers to like and subscribe.
 
+RETENTION RULES (YouTube algorithm optimization):
+- The first 3 seconds determine if viewers stay. Open with the most VISUALLY STRIKING
+  fact — something that pairs with dramatic footage (an extreme landscape, a jaw-dropping
+  stat, a counterintuitive image).
+- DO NOT front-load all surprises in the first 15 seconds. Spread "wow I didn't know that"
+  moments EVENLY across the script — aim for one every 15-20 seconds.
+- Plant open loops: hint at an upcoming revelation ("but the real reason is even stranger...")
+  to prevent drop-off at the 30-50% mark (where most viewers leave).
+- End the LAST paragraph before the CTA with a strong final surprise — viewers who reach
+  the end boost your average view duration significantly.
+- Vary emotional rhythm: fact → comparison → mini-story → surprising stat. Monotone
+  fact-listing kills retention even if the facts are good.
+
 THE VIEWER SHOULD FEEL: "Wow I didn't know that" at least 3-4 times in a {duration}s video.
 
 Concept:
@@ -144,9 +157,16 @@ Goal:
 - Find ideas that can become bright, curious, story-driven geography videos.
 - Prefer "why/how" topics with a clear map/geography reason.
 - Avoid generic trivia, war gore, hateful framing, political propaganda, or doom-only angles.
-- Avoid repeating topics already used.
+- Avoid repeating topics already used (see "Previously used topics" AND "Published channel videos" below).
 - Each topic must be specific enough for a 60-90 second video.
 - Titles/topic ideas should be in Vietnamese.
+
+DEDUPLICATION:
+- Check BOTH "Previously used topics" and "Published channel videos" lists.
+- Do NOT suggest any topic that overlaps with an already-published video title.
+  Two videos about the same subject (even with different wording) = duplicate.
+  Example: if published list has "Vì sao Nhật Bản hay động đất?", do NOT suggest
+  "Tại sao Nhật Bản có nhiều trận động đất?" — same topic, different words.
 
 Trend and competitor context:
 {input}
@@ -224,9 +244,17 @@ You will receive NICHE-SPECIFIC research data:
 - **Google related searches**: what people search for WITHIN this topic
 - **Web research**: articles, forums, listicles about this topic
 - **Reddit niche posts**: discussions in relevant subreddits
+- **_published_channel_titles**: titles of videos ALREADY PUBLISHED on our channel (MUST AVOID)
 
 Your job is NOT to suggest random trending topics. Your ONLY job is to find the BEST video
 ideas WITHIN this specific niche. Every single idea must be directly about {input}.
+
+CRITICAL — DEDUPLICATION RULE:
+If the data includes "_published_channel_titles", you MUST NOT suggest any idea that covers
+the same topic/angle/question as an already-published video. Check each idea against the
+published titles list. If a published video already covers "Vì sao Mông Cổ ít người?",
+do NOT suggest anything about Mongolia's low population density — the audience has already
+seen it. Find genuinely NEW angles within the niche.
 
 Analysis approach:
 1. **Competitor gap analysis** — what do the top-performing competitor videos cover? What do they MISS?
@@ -234,6 +262,7 @@ Analysis approach:
 3. **Engagement signals** — which competitor videos have unusually high engagement rates?
 4. **Content depth gaps** — where do existing videos stay surface-level but the topic deserves deep exploration?
 5. **Angle originality** — what fresh angle hasn't been tried for this topic?
+6. **Channel dedup** — cross-check against published titles; skip any topic already covered
 
 STRICT RULES:
 - Every idea MUST be about {input}. Zero off-topic ideas.
@@ -420,10 +449,16 @@ Priority: broll_stock → broll_ai_image → broll_ai_video (last resort, max 2)
 Stock search queries:
 - ALL query values MUST be in ENGLISH regardless of script language
 - Be SPECIFIC and DESCRIPTIVE (4-6 words): "busy tokyo crosswalk night rain" NOT "city street"
-- Describe the EXACT visual: subject + setting + action + mood
-- BAD: "technology", "nature", "city" (too vague)
+- Describe the EXACT visual the VIEWER should see while hearing the narration
+- Query must SEMANTICALLY MATCH the narration — what visual illustrates these words?
+  Example: narration "Mongolia has just 2.2 people per km²" → query "vast empty mongolian steppe grassland"
+  Example: narration "trade routes carried silk and spices" → query "ancient caravan desert silk road camels"
+- BAD: "technology", "nature", "city" (too vague, returns random footage)
+- BAD: paraphrasing the narration literally (stock sites have visual descriptions, not narration text)
 - GOOD: "scientist examining microscope laboratory", "misty mountain sunrise timelapse"
-- If script is non-English, TRANSLATE the concept to English for query, keep caption in original language
+- Think: "if a photographer labeled this video, what words would they use?"
+- Prefer queries with: subject + setting + action/mood + distinguishing detail
+- If script is non-English, TRANSLATE the visual concept to English for query, keep caption in original language
 
 Rules:
 - Each scene 3-8 seconds
@@ -431,6 +466,16 @@ Rules:
 - Assign narration text to each scene so they add up to the full script
 - Set style.music_mood to one of: cinematic, upbeat, minimal, dramatic
 - Every scene must have real visuals (stock or AI), never plain text on screen
+
+YOUTUBE RETENTION — VISUAL PACING:
+- FIRST SCENE (s001) must be the most VISUALLY STRIKING footage in the entire video.
+  Use an arresting aerial, dramatic landscape, extreme closeup, or cinematic establishing
+  shot. This is where 70% of viewers decide to stay or leave. Query must target the most
+  impressive visual possible for the topic.
+- Vary shot types throughout: alternate wide/aerial → medium → closeup → wide.
+  Never use 3+ consecutive scenes with the same visual scale.
+- Scene s001 should be 3-4 seconds (short, punchy). Scenes in the middle can go up to 6-8s.
+- LAST scene before CTA should also be visually memorable (bookend effect).
 
 Script:
 {input}
@@ -492,9 +537,15 @@ DO NOT use any Remotion templates: no kinetic_text, title_card, map_highlight, f
 Stock search queries:
 - ALL query values MUST be in ENGLISH even when the script is in Vietnamese or another language
 - Be SPECIFIC: "crowded delhi street market spices" NOT "India market"
-- Describe the EXACT visual: subject + setting + action + detail
+- Describe the EXACT visual the VIEWER should see while hearing the narration
+- Query must SEMANTICALLY MATCH what the narration describes — picture the ideal b-roll shot
+  Example: narration "Sông Mê Kông dài hơn 4000km" → query "mekong river aerial wide flowing through countryside"
+  Example: narration "dân số chỉ 2.2 người/km²" → query "vast empty mongolian steppe grassland yurt"
 - BAD: "landscape", "people", "building" (returns unrelated generic footage)
+- BAD: paraphrasing text literally — stock videos are tagged by VISUAL content, not concepts
 - GOOD: "himalayan snow peaks aerial sunrise", "vietnamese floating market mekong river", "ancient temple angkor wat moss"
+- Think: "what would a cinematographer film to illustrate this sentence?"
+- Prefer queries with: subject + setting + action/mood + distinguishing visual detail
 
 Hard rules:
 - Each scene should be 3-7 seconds.
@@ -503,6 +554,15 @@ Hard rules:
 - Use broll_ai_video only for motion that cannot be faked by image+zoom, maximum 2 scenes.
 - Scene narration texts must concatenate to the full script in order.
 - Total duration should be close to {duration}s, but voiceover will be the source of truth.
+
+YOUTUBE RETENTION — VISUAL PACING:
+- FIRST SCENE (s001) must be the most VISUALLY STRIKING footage in the entire video.
+  Use an arresting aerial, dramatic landscape, extreme closeup, or cinematic establishing
+  shot. This is where 70% of viewers decide to stay or leave.
+- Vary shot types: alternate wide/aerial → medium → closeup → wide. Never 3+ consecutive
+  scenes with the same visual scale.
+- s001 should be 3-4s (short, punchy). Middle scenes can go up to 7s.
+- LAST scene before CTA should also be visually memorable (bookend effect).
 
 Script:
 {input}
@@ -557,6 +617,10 @@ Rules:
 - position_fraction estimates how far through the script's runtime this moment occurs (0.0 = start, 1.0 = end).
 - duration_s between 4 and 6.
 - Don't invent statistics or facts not present in the script.
+- ABSOLUTELY NO REPEATED REGIONS. Each region may appear AT MOST ONCE in the entire list.
+  Two map_highlight overlays for the same country/region render an IDENTICAL animation and
+  look broken in the final video. If the script mentions "Vietnam" 5 times, only create
+  ONE map_highlight for Vietnam — pick the BEST moment.
 - For map_highlight, choose the MOST SPECIFIC mappable place named in that script moment:
   country > city/landmark/river/desert/region > continent. Do NOT use a continent when
   the sentence names a country or place inside that continent. Examples:
@@ -566,8 +630,8 @@ Rules:
   NOT generic "Châu Phi" unless the narration is explicitly about the whole continent.
 - Use continent regions like "Châu Phi" only when the narration is truly about the entire
   continent as a whole, not when it is discussing a specific country/place within it.
-- Do not create multiple map_highlight overlays for the same country/region/place. A repeated
-  map of the same region looks identical; use at most one map_highlight per unique region.
+- IMPORTANT: Each headline/subline MUST be different text. The headline should describe the
+  specific fact being stated at that moment, making each map overlay visually unique.
 - Skip this entirely (return []) if the script has no clear place names or stats to highlight.
 
 Concept context:
@@ -592,16 +656,42 @@ Return ONLY a valid JSON array:
   }}
 ]""",
 
-    "generate_seo": """You are a YouTube SEO expert.
-Given a video script, generate optimized metadata as JSON:
-- title: SEO-optimized title (max 70 chars, include main keyword)
-- description: full description (300-500 words, first 125 chars are crucial)
-- tags: list of 15 tags (mix broad + specific)
+    "generate_seo": """You are a YouTube SEO expert optimizing for the YouTube algorithm.
+Given a video script and optional research context, generate optimized metadata as JSON.
+
+YOUTUBE ALGORITHM SEO RULES:
+- title: Max 70 chars. Front-load the main keyword. Use a curiosity gap or surprising
+  number. The title must make someone on the Home feed CLICK.
+  GOOD: "Vì Sao Mông Cổ Chỉ Có 2 Người/km²?" (specific, curious)
+  BAD: "Sự Thật Về Mông Cổ" (vague, no hook)
+- description: First 125 chars appear in search results — must contain the primary keyword
+  naturally. Full description 300-500 words. Include 3-5 keyword phrases from the script
+  as natural sentences (not keyword stuffing). Add timestamps if the video has clear sections.
+  Include 3-5 relevant hashtags at the end of the description.
+- tags: 15 tags. First 3 tags = exact phrases people search (from Google Trends related
+  queries if available in context). Mix: 5 specific long-tail, 5 medium, 5 broad.
+  If context includes google_related_searches or research data, use those EXACT trending
+  query phrases as tags — they represent proven search demand.
 - category: YouTube category name
-- thumbnail_text: 3-5 words for thumbnail overlay
+- thumbnail_text: 2-4 words MAX for thumbnail overlay. Must be readable at phone size.
+  Include a number or surprising word. GOOD: "2 NGƯỜI/KM²". BAD: "Sự Thật Thú Vị Về Địa Lý"
+
+COMPETITOR ANALYSIS (if provided in context):
+If the context includes "competitor_analysis", use it heavily:
+- common_tags: These are tags that TOP-RANKING videos actually use. Include the most
+  relevant ones in your tags list — they represent proven discoverability.
+- common_title_words: These words appear in successful titles. Incorporate the most
+  relevant ones naturally into your title.
+- top_titles: Study what patterns these winning titles use (numbers, questions, brackets).
+  Match the pattern but don't copy.
+- top_hashtags: Use the most relevant competitor hashtags in the description.
+- avg_views: Use this to gauge competition level — higher avg views = more competitive
+  keyword, may need a more specific/unique angle in the title.
 
 Script:
 {input}
+
+{context_section}
 
 Respond ONLY with valid JSON.""",
 

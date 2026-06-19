@@ -13,6 +13,7 @@ import random
 import subprocess
 import sys
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -439,6 +440,111 @@ def _ensure_english_query(query: str, narration: str = "") -> str:
     return query
 
 
+def _check_thumbnail_relevance(preview_url: str, narration: str, query: str) -> bool:
+    """Check if a stock video's thumbnail semantically matches the narration.
+
+    Uses a cheap vision model to ACCEPT/REJECT. Returns True on error (fail-open).
+    Skipped if OPENROUTER_API_KEY is not set or SKIP_SEMANTIC_FILTER=1.
+    """
+    if os.getenv("SKIP_SEMANTIC_FILTER", "").lower() in ("1", "true"):
+        return True
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key or not preview_url:
+        return True
+
+    try:
+        from helpers.llm_task import call_openrouter_vision, TASK_MODELS
+        model = TASK_MODELS.get("verify_stock_relevance", "google/gemini-2.5-flash-lite")
+        prompt = (
+            "You are a strict visual relevance checker for a video b-roll scene.\n"
+            f"Narration being spoken: \"{narration[:200]}\"\n"
+            f"Stock search query: \"{query}\"\n\n"
+            "Look at this thumbnail. Does it visually match what the narrator is describing?\n"
+            "REJECT if: wrong geography, completely unrelated subject, culturally mismatched.\n"
+            "ACCEPT if: matches the visual concept, or generic enough to work.\n"
+            "Respond with ONLY one word: ACCEPT or REJECT"
+        )
+        result = call_openrouter_vision(model, prompt, preview_url, api_key)
+        accepted = "ACCEPT" in result.upper()
+        if not accepted:
+            print(f"[assembler] semantic REJECT: '{query}' thumbnail doesn't match narration", file=sys.stderr)
+        return accepted
+    except Exception as e:
+        print(f"[assembler] semantic check failed (accepting anyway): {e}", file=sys.stderr)
+        return True
+
+
+def _generate_query_variants(query: str, narration: str) -> list[str]:
+    """Generate 2-3 alternative stock search queries from narration.
+
+    If the primary query fails semantic matching, we try these alternatives.
+    Uses LLM for non-trivial cases, falls back to keyword extraction.
+    """
+    variants = [query]
+
+    # Extract noun phrases from narration as fallback queries
+    narration_words = narration.split()
+    stop_words = {
+        "the", "a", "an", "is", "are", "was", "were", "of", "in", "to", "and",
+        "for", "on", "with", "that", "this", "it", "from", "by", "as", "at",
+        "or", "but", "not", "be", "have", "has", "had", "do", "does", "did",
+        "will", "would", "can", "could", "should", "may", "might", "shall", "must",
+    }
+    content_words = [
+        w.strip(".,!?;:\"'()[]").lower()
+        for w in narration_words
+        if len(w) > 3 and w.strip(".,!?;:\"'()[]").lower() not in stop_words
+    ]
+
+    # Build 2 keyword-based variants from different parts of narration
+    if len(content_words) >= 4:
+        mid = len(content_words) // 2
+        variant1 = " ".join(content_words[:4])
+        variant2 = " ".join(content_words[mid:mid + 4])
+        if variant1 != query:
+            variants.append(variant1)
+        if variant2 != query and variant2 != variant1:
+            variants.append(variant2)
+    elif content_words:
+        variants.append(" ".join(content_words[:4]))
+
+    # Try LLM for better queries
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if api_key and narration:
+        try:
+            import httpx as _httpx
+            resp = _httpx.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "google/gemini-2.5-flash-lite",
+                    "messages": [{"role": "user", "content": (
+                        f"Generate 2 alternative English stock video search queries (4-6 words each) "
+                        f"that would find footage matching this narration:\n"
+                        f"\"{narration[:300]}\"\n\n"
+                        f"The original query was: \"{query}\"\n"
+                        f"Give different angles/visuals. One line per query, nothing else."
+                    )}],
+                    "temperature": 0.7,
+                    "max_tokens": 60,
+                },
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                lines = resp.json()["choices"][0]["message"]["content"].strip().splitlines()
+                for line in lines[:2]:
+                    clean = line.strip().strip("- ").strip('"\'')
+                    if clean and len(clean) > 5 and clean != query:
+                        variants.append(clean)
+        except Exception:
+            pass
+
+    return variants[:4]  # cap at 4 total
+
+
 def fetch_stock_clip(
     scene: dict,
     output: Path,
@@ -494,56 +600,57 @@ def fetch_stock_clip(
     if api_key:
         try:
             import httpx, urllib.request
-            # Fetch more results so we can skip already-used ones
-            r = httpx.get(
-                "https://api.pexels.com/videos/search",
-                headers={"Authorization": api_key},
-                params={"query": query, "per_page": 15, "size": "medium"},
-                timeout=15,
-            )
-            r.raise_for_status()
-            videos = r.json().get("videos", [])
-            landscape = [v for v in videos if v.get("width", 0) >= v.get("height", 1)]
 
-            # Pick first video whose ID hasn't been used yet
-            chosen = None
-            for v in landscape:
-                vid_id = v.get("id")
-                if vid_id not in used_video_ids:
-                    chosen = v
-                    break
+            # Multi-query strategy: try primary query, then variants if semantic check fails
+            queries_to_try = _generate_query_variants(query, narration)
 
-            # All results exhausted — try page 2
-            if not chosen:
-                print(f"[assembler] all page-1 results used for '{query}', fetching page 2", file=sys.stderr)
-                r2 = httpx.get(
+            for q_idx, current_query in enumerate(queries_to_try):
+                current_query = _ensure_english_query(current_query, narration) if q_idx > 0 else query
+
+                r = httpx.get(
                     "https://api.pexels.com/videos/search",
                     headers={"Authorization": api_key},
-                    params={"query": query, "per_page": 15, "size": "medium", "page": 2},
+                    params={"query": current_query, "per_page": 15, "size": "medium"},
                     timeout=15,
                 )
-                if r2.status_code == 200:
-                    p2 = [v for v in r2.json().get("videos", []) if v.get("width", 0) >= v.get("height", 1)]
-                    chosen = next((v for v in p2 if v.get("id") not in used_video_ids), None)
+                if r.status_code != 200:
+                    continue
+                videos = r.json().get("videos", [])
+                landscape = [v for v in videos if v.get("width", 0) >= v.get("height", 1)]
 
-            if chosen:
-                vid_id = chosen.get("id")
-                files = chosen.get("video_files", [])
-                files_hd = [f for f in files if f.get("width", 0) >= 1280]
-                dl_url = (files_hd or files)[0].get("link", "")
-                if dl_url:
-                    # Cache by video ID so same clip reused only if explicitly requested
-                    cached = downloads_dir / f"stock_{vid_id}.mp4"
-                    if not (cached.exists() and cached.stat().st_size > 10000):
-                        downloads_dir.mkdir(parents=True, exist_ok=True)
-                        req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req, timeout=60) as resp, open(cached, "wb") as f:
-                            f.write(resp.read())
-                        print(f"[assembler] downloaded stock id={vid_id}: {cached.name}", file=sys.stderr)
-                    else:
-                        print(f"[assembler] stock cache hit id={vid_id}", file=sys.stderr)
-                    used_video_ids.add(vid_id)
-                    return trim_to_duration(cached, duration_s, output, random_seek=True)
+                # Pick first video that passes: (1) not used, (2) semantic relevance check
+                chosen = None
+                for v in landscape:
+                    vid_id = v.get("id")
+                    if vid_id in used_video_ids:
+                        continue
+                    # Semantic check: verify thumbnail matches narration
+                    preview_url = v.get("image", "")
+                    if _check_thumbnail_relevance(preview_url, narration, current_query):
+                        chosen = v
+                        break
+
+                if chosen:
+                    vid_id = chosen.get("id")
+                    files = chosen.get("video_files", [])
+                    files_hd = [f for f in files if f.get("width", 0) >= 1280]
+                    dl_url = (files_hd or files)[0].get("link", "")
+                    if dl_url:
+                        cached = downloads_dir / f"stock_{vid_id}.mp4"
+                        if not (cached.exists() and cached.stat().st_size > 10000):
+                            downloads_dir.mkdir(parents=True, exist_ok=True)
+                            req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
+                            with urllib.request.urlopen(req, timeout=60) as resp, open(cached, "wb") as f:
+                                f.write(resp.read())
+                            print(f"[assembler] downloaded stock id={vid_id} (query '{current_query}'): {cached.name}", file=sys.stderr)
+                        else:
+                            print(f"[assembler] stock cache hit id={vid_id}", file=sys.stderr)
+                        used_video_ids.add(vid_id)
+                        return trim_to_duration(cached, duration_s, output, random_seek=True)
+
+                if q_idx < len(queries_to_try) - 1:
+                    print(f"[assembler] query '{current_query}' found no relevant match, trying variant...", file=sys.stderr)
+
         except Exception as e:
             print(f"[assembler] pexels fetch failed: {e}", file=sys.stderr)
 
@@ -768,70 +875,111 @@ def assemble(storyboard: dict, voiceover_path: Path, output_path: Path) -> Path:
 
     rendered_clips: list[Path] = []
 
+    # Phase 1: Resolve budget/type decisions sequentially (cheap, no I/O).
+    # Produces a plan list with final scene type + output paths.
+    render_plan: list[dict] = []
     for i, scene in enumerate(scenes):
         scene_id = scene.get("id", f"s{i:03d}")
         scene_type = scene.get("type", "remotion")
         if storyboard_sources:
             scene.setdefault("_sources", storyboard_sources)
+
         raw_clip = work_dir / f"{scene_id}_raw.mp4"
         norm_clip = work_dir / f"{scene_id}_norm.mp4"
+        resolved_type = scene_type
 
-        print(f"[assembler] scene {i+1}/{len(scenes)} [{scene_type}] {scene_id}", file=sys.stderr)
+        # Degrade animation types to stock
+        if scene_type in ("remotion", "pil", "pil_animation", "text_card", "hyperframes", "hf"):
+            print(f"[assembler] degrading {scene_id} [{scene_type}] → broll_stock", file=sys.stderr)
+            scene["props"] = scene.get("props", {})
+            if not scene["props"].get("query"):
+                scene["props"]["query"] = scene.get("narration", "cinematic landscape")[:60]
+            resolved_type = "broll_stock"
+
+        # Budget gating for paid types
+        elif scene_type in ("broll_ai_image", "ai_image"):
+            if not spend(scene_id, AI_IMAGE_COST):
+                print(f"[assembler] degrading {scene_id} to stock (budget)", file=sys.stderr)
+                scene["props"] = scene.get("props", {})
+                scene["props"]["query"] = scene.get("narration", "technology")[:40]
+                resolved_type = "broll_stock"
+            else:
+                resolved_type = "broll_ai_image"
+
+        elif scene_type in ("broll_ai_video", "ai_video", "broll_ai", "ai"):
+            duration_s = min(scene.get("duration_s", 5.0), SEEDANCE_MAX_DURATION_S)
+            clip_cost = duration_s * SEEDANCE_COST_PER_S
+            if seedance_clips_used >= SEEDANCE_MAX_CLIPS:
+                print(f"[assembler] Seedance clip limit ({SEEDANCE_MAX_CLIPS}) reached — downgrade to ai_image", file=sys.stderr)
+                resolved_type = "broll_ai_image"
+                spend(scene_id, AI_IMAGE_COST)
+            elif not spend(scene_id, clip_cost):
+                print(f"[assembler] Seedance over budget — downgrade to ai_image", file=sys.stderr)
+                resolved_type = "broll_ai_image"
+                spend(scene_id, AI_IMAGE_COST)
+            else:
+                resolved_type = "broll_ai_video"
+                seedance_clips_used += 1
+
+        render_plan.append({
+            "index": i,
+            "scene": scene,
+            "scene_id": scene_id,
+            "resolved_type": resolved_type,
+            "raw_clip": raw_clip,
+            "norm_clip": norm_clip,
+        })
+
+    # Phase 2: Render scenes in parallel (Rule 10 — never sequential for independent work).
+    max_workers = int(os.getenv("ASSEMBLER_WORKERS", "4"))
+
+    def _render_one(plan: dict) -> tuple[int, Path | None]:
+        """Render a single scene. Returns (index, norm_clip_path or None)."""
+        i = plan["index"]
+        scene = plan["scene"]
+        scene_id = plan["scene_id"]
+        resolved_type = plan["resolved_type"]
+        raw_clip = plan["raw_clip"]
+        norm_clip = plan["norm_clip"]
+
+        print(f"[assembler] scene {i+1}/{len(scenes)} [{resolved_type}] {scene_id}", file=sys.stderr)
 
         try:
-            if scene_type in ("remotion", "pil", "pil_animation", "text_card", "hyperframes", "hf"):
-                # Degrade text/animation scenes to stock footage
-                print(f"[assembler] degrading {scene_id} [{scene_type}] → broll_stock", file=sys.stderr)
-                scene["props"] = scene.get("props", {})
-                if not scene["props"].get("query"):
-                    scene["props"]["query"] = scene.get("narration", "cinematic landscape")[:60]
+            if resolved_type in ("broll_stock", "stock"):
                 fetch_stock_clip(scene, raw_clip, downloads_dir, used_video_ids, used_queries)
-            elif scene_type in ("broll_stock", "stock"):
-                fetch_stock_clip(scene, raw_clip, downloads_dir, used_video_ids, used_queries)
-            elif scene_type in ("broll_ai_image", "ai_image"):
-                # Together Flux Free = $0; Gemini fallback = ~$0.04
-                img_cost = AI_IMAGE_COST
-                if not spend(scene_id, img_cost):
-                    # Budget exceeded — degrade to stock video
-                    print(f"[assembler] degrading {scene_id} to stock (budget)", file=sys.stderr)
-                    scene["props"] = scene.get("props", {})
-                    scene["props"]["query"] = scene.get("narration", "technology")[:40]
-                    fetch_stock_clip(scene, raw_clip, downloads_dir, used_video_ids, used_queries)
-                else:
-                    render_ai_image_scene(scene, raw_clip, work_dir)
-
-            elif scene_type in ("broll_ai_video", "ai_video", "broll_ai", "ai"):
-                # Seedance: hard clip + count limit
+            elif resolved_type in ("broll_ai_image", "ai_image"):
+                render_ai_image_scene(scene, raw_clip, work_dir)
+            elif resolved_type in ("broll_ai_video", "ai_video"):
                 duration_s = min(scene.get("duration_s", 5.0), SEEDANCE_MAX_DURATION_S)
-                clip_cost = duration_s * SEEDANCE_COST_PER_S
-
-                if seedance_clips_used >= SEEDANCE_MAX_CLIPS:
-                    print(f"[assembler] Seedance clip limit ({SEEDANCE_MAX_CLIPS}) reached — downgrade to ai_image", file=sys.stderr)
-                    scene["type"] = "broll_ai_image"
-                    render_ai_image_scene(scene, raw_clip, work_dir)
-                    spend(scene_id, AI_IMAGE_COST)
-                elif not spend(scene_id, clip_cost):
-                    print(f"[assembler] Seedance over budget — downgrade to ai_image", file=sys.stderr)
-                    render_ai_image_scene(scene, raw_clip, work_dir)
-                    spend(scene_id, AI_IMAGE_COST)
-                else:
-                    render_seedance_scene(scene, raw_clip, duration_s)
-                    seedance_clips_used += 1
-
+                render_seedance_scene(scene, raw_clip, duration_s)
             else:
-                print(f"[assembler] unknown scene type: {scene_type}, skipping", file=sys.stderr)
-                continue
+                print(f"[assembler] unknown scene type: {resolved_type}, skipping", file=sys.stderr)
+                return (i, None)
 
             if not raw_clip.exists() or raw_clip.stat().st_size < 1000:
                 print(f"[assembler] scene {scene_id} produced no output, skipping", file=sys.stderr)
-                continue
+                return (i, None)
 
             normalize_clip(raw_clip, norm_clip)
-            rendered_clips.append(norm_clip)
+            return (i, norm_clip)
 
         except Exception as e:
             print(f"[assembler] scene {scene_id} failed: {e}, skipping", file=sys.stderr)
-            continue
+            return (i, None)
+
+    # Execute rendering in parallel
+    results: dict[int, Path | None] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_render_one, plan): plan["index"] for plan in render_plan}
+        for future in as_completed(futures):
+            idx, clip_path = future.result()
+            results[idx] = clip_path
+
+    # Collect in original order (preserves storyboard sequence)
+    for i in range(len(render_plan)):
+        clip = results.get(i)
+        if clip and clip.exists() and clip.stat().st_size > 1000:
+            rendered_clips.append(clip)
 
     if not rendered_clips:
         raise ValueError("No scenes rendered successfully")

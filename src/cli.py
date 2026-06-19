@@ -295,7 +295,20 @@ def research(topic, region, output, subreddits):
             out_path = out_path.resolve()
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Write research data as context, topic as input
+            # Fetch already-published videos from YouTube channel to avoid repeats
+            published_titles: list[str] = []
+            try:
+                from src.modules.youtube_uploader import YouTubeUploader
+                uploader = YouTubeUploader()
+                published_titles = uploader.get_channel_titles(max_results=200)
+                if published_titles:
+                    click.secho(f" Found {len(published_titles)} published videos on channel (will exclude from ideas)", fg="cyan")
+            except Exception as e:
+                click.secho(f" Could not fetch channel videos (skipping dedup): {e}", fg="yellow")
+
+            # Write research data as context, topic as input — include published titles for exclusion
+            report["_published_channel_titles"] = published_titles
+            report_json = _json.dumps(report, ensure_ascii=False, default=str)
             tmp_context = out_path.parent / "_research_context_tmp.json"
             tmp_context.write_text(report_json, encoding="utf-8")
 

@@ -249,8 +249,21 @@ class GeographyAutopilot:
     def _generate_topic_candidates(self, trend_context: str, state: dict[str, Any]) -> list[dict[str, Any]]:
         candidates_path = self.base_dir / "latest_topic_candidates.json"
         used = [item.get("topic", "") for item in state.get("used_topics", [])[-80:]]
+
+        # Also fetch published YouTube titles to avoid covering same topics
+        published_titles: list[str] = []
+        try:
+            from src.modules.youtube_uploader import YouTubeUploader
+            uploader = YouTubeUploader()
+            published_titles = uploader.get_channel_titles(max_results=200)
+            self.logger.info(f"[autopilot] fetched {len(published_titles)} published titles for dedup")
+        except Exception as e:
+            self.logger.warning(f"[autopilot] could not fetch channel titles: {e}")
+
+        # Combine used topics + published titles into exclusion list
+        all_exclusions = used + [f"[PUBLISHED] {t}" for t in published_titles]
         used_path = self.base_dir / "used_topics_context.txt"
-        used_path.write_text("\n".join(used), encoding="utf-8")
+        used_path.write_text("\n".join(all_exclusions), encoding="utf-8")
         trend_path = self.base_dir / "trend_context.txt"
         trend_path.write_text(trend_context, encoding="utf-8")
 

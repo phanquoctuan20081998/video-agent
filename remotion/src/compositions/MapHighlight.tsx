@@ -121,10 +121,23 @@ const RealMap: React.FC<{
   );
 };
 
-export const MapHighlight: React.FC<MapHighlightProps> = ({ region, accent_color = "#FFD400" }) => {
+export const MapHighlight: React.FC<MapHighlightProps> = ({
+  region,
+  headline,
+  subline,
+  callouts,
+  marker_label,
+  accent_color = "#FFD400",
+}) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
   const match = resolveRegion(region);
+
+  // Text overlay: headline + subline + callouts (differentiate same-region maps)
+  const textProgress = interpolate(frame, [25, 45], [0, 1], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
 
   return (
     <AbsoluteFill style={{ overflow: "hidden" }}>
@@ -149,6 +162,82 @@ export const MapHighlight: React.FC<MapHighlightProps> = ({ region, accent_color
           />
         </AbsoluteFill>
       )}
+      {/* Headline / subline / callouts overlay — makes same-region maps visually distinct */}
+      <div
+        style={{
+          position: "absolute",
+          bottom: 60,
+          left: 80,
+          right: 80,
+          opacity: textProgress,
+          transform: `translateY(${interpolate(textProgress, [0, 1], [20, 0])}px)`,
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+        }}
+      >
+        {headline && (
+          <div
+            style={{
+              fontFamily: "Inter, Arial, sans-serif",
+              fontSize: 42,
+              fontWeight: 800,
+              color: "#fff",
+              textShadow: "0 3px 12px rgba(0,0,0,0.9)",
+              lineHeight: 1.1,
+            }}
+          >
+            {headline}
+          </div>
+        )}
+        {subline && (
+          <div
+            style={{
+              fontFamily: "Inter, Arial, sans-serif",
+              fontSize: 28,
+              fontWeight: 500,
+              color: accent_color,
+              textShadow: "0 2px 8px rgba(0,0,0,0.8)",
+            }}
+          >
+            {subline}
+          </div>
+        )}
+        {callouts && callouts.length > 0 && (
+          <div style={{ display: "flex", gap: 16, marginTop: 8 }}>
+            {callouts.map((c, i) => (
+              <div
+                key={i}
+                style={{
+                  fontFamily: "Inter, Arial, sans-serif",
+                  fontSize: 22,
+                  fontWeight: 600,
+                  color: "#e0e0e0",
+                  background: "rgba(0,0,0,0.55)",
+                  padding: "6px 14px",
+                  borderRadius: 6,
+                  borderLeft: `3px solid ${accent_color}`,
+                }}
+              >
+                {c}
+              </div>
+            ))}
+          </div>
+        )}
+        {marker_label && !headline && (
+          <div
+            style={{
+              fontFamily: "Inter, Arial, sans-serif",
+              fontSize: 36,
+              fontWeight: 700,
+              color: "#fff",
+              textShadow: "0 2px 10px rgba(0,0,0,0.85)",
+            }}
+          >
+            {marker_label}
+          </div>
+        )}
+      </div>
     </AbsoluteFill>
   );
 };

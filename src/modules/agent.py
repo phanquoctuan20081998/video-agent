@@ -348,7 +348,7 @@ class VideoAgent:
 
         # ── Step 9: Upload ────────────────────────────────────────────────────
         if auto_upload:
-            metadata = await self._generate_seo(script, work_dir)
+            metadata = await self._generate_seo(script, work_dir, concept=concept)
             await self._upload(final_path, metadata, concept=concept, topic=topic)
 
         self._persist_session(session)
@@ -502,7 +502,7 @@ class VideoAgent:
 
         # Step S6: Upload
         if auto_upload:
-            metadata = await self._generate_seo(script, work_dir)
+            metadata = await self._generate_seo(script, work_dir, concept=concept)
             await self._upload(final_path, metadata, concept=concept, topic=session.topic)
 
         self._persist_session(session)
@@ -594,7 +594,7 @@ class VideoAgent:
         session.final_path = str(final_path)
 
         if auto_upload:
-            metadata = await self._generate_seo(script, work_dir)
+            metadata = await self._generate_seo(script, work_dir, concept=concept)
             await self._upload(final_path, metadata, concept=concept, topic=session.topic)
 
         self._persist_session(session)
@@ -1058,9 +1058,9 @@ class VideoAgent:
         if auto_upload:
             script_path = base_work_dir / "script.txt"
             script = script_path.read_text() if script_path.exists() else topic
-            metadata = await self._generate_seo(script, base_work_dir)
             concept_path = base_work_dir / "concept.json"
             concept = json.loads(concept_path.read_text()) if concept_path.exists() else {}
+            metadata = await self._generate_seo(script, base_work_dir, concept=concept)
             await self._upload(final_path, metadata, concept=concept, topic=topic)
 
         return str(final_path)
@@ -1480,16 +1480,32 @@ class VideoAgent:
 
     @staticmethod
     def _dedupe_overlay_specs(specs: list[dict]) -> list[dict]:
-        """Drop duplicate map highlights that would render the same region-only animation."""
+        """Drop duplicate map highlights that would render the same region-only animation.
+
+        Normalizes region names to catch aliases (e.g. "Việt Nam" == "Vietnam" == "viet nam").
+        """
         deduped: list[dict] = []
         seen_map_regions: set[str] = set()
+
+        # Simple normalization: lowercase, strip diacritics approximation, collapse spaces
+        def _normalize_region(r: str) -> str:
+            import unicodedata
+            # NFD decompose, strip combining marks, lowercase
+            nfkd = unicodedata.normalize("NFKD", r)
+            ascii_approx = "".join(c for c in nfkd if not unicodedata.combining(c))
+            return " ".join(ascii_approx.casefold().split())
+
         for spec in specs:
             if spec.get("template") != "map_highlight":
                 deduped.append(spec)
                 continue
             props = spec.get("props") if isinstance(spec.get("props"), dict) else {}
-            region_key = str(props.get("region") or "").strip().casefold()
+            region_raw = str(props.get("region") or "").strip()
+            region_key = _normalize_region(region_raw)
             if region_key and region_key in seen_map_regions:
+                # Log the duplicate being dropped
+                import sys
+                print(f"[agent] dedupe: dropping duplicate map_highlight for '{region_raw}'", file=sys.stderr)
                 continue
             if region_key:
                 seen_map_regions.add(region_key)
@@ -1755,20 +1771,66 @@ class VideoAgent:
     def _count_srt_cues(srt_path: Path) -> int:
         return srt_path.read_text().count(" --> ")
 
-    async def _generate_seo(self, script: str, work_dir: Path) -> dict:
+    async def _generate_seo(self, script: str, work_dir: Path, concept: dict | None = None) -> dict:
         script_path = work_dir / "script.txt"
         metadata_path = work_dir / "metadata.json"
         if not script_path.exists():
             script_path.write_text(script)
-        self._run_helper([
+
+        # Competitor analysis: fetch what top-ranking videos use for this topic
+        seo_context = dict(concept) if concept else {}
+        topic_query = seo_context.get("title") or seo_context.get("topic") or ""
+        if topic_query:
+            try:
+                from src.modules.youtube_uploader import YouTubeUploader
+                uploader = YouTubeUploader()
+                competitor_data = await asyncio.to_thread(
+                    uploader.analyze_competitors, topic_query, 25
+                )
+                seo_context["competitor_analysis"] = competitor_data
+                self.logger.info(
+                    f"[agent] competitor SEO: {len(competitor_data.get('common_tags', []))} tags, "
+                    f"{len(competitor_data.get('top_titles', []))} titles, "
+                    f"avg {competitor_data.get('avg_views', 0):,} views"
+                )
+            except Exception as e:
+                self.logger.warning(f"[agent] competitor analysis skipped: {e}")
+
+        cmd = [
             "helpers/llm_task.py",
             "--task", "generate_seo",
             "--input", str(script_path),
             "--output", str(metadata_path),
-        ], "generate SEO metadata")
+        ]
+
+        # Pass concept + competitor data so SEO uses real ranking signals
+        if seo_context:
+            context_path = work_dir / "_seo_context.json"
+            context_path.write_text(json.dumps(seo_context, indent=2, ensure_ascii=False))
+            cmd += ["--context", str(context_path)]
+
+        self._run_helper(cmd, "generate SEO metadata")
         if not metadata_path.exists():
             return {}
         metadata = json.loads(metadata_path.read_text())
+
+        # SEO score check — log quality before upload
+        try:
+            from src.modules.youtube_uploader import YouTubeUploader
+            seo_score = YouTubeUploader.calculate_seo_score(
+                metadata.get("title", ""),
+                metadata.get("description", ""),
+                metadata.get("tags", []),
+            )
+            self.logger.info(
+                f"[agent] SEO score: {seo_score['score']}/100 (grade {seo_score['grade']})"
+            )
+            if seo_score["feedback"]:
+                for tip in seo_score["feedback"]:
+                    self.logger.info(f"[agent] SEO tip: {tip}")
+            metadata["_seo_score"] = seo_score
+        except Exception as e:
+            self.logger.warning(f"[agent] SEO scoring skipped: {e}")
 
         # CC-BY (and similar) tracks require attribution — append it to the
         # description so it ships even on auto-upload. assets/music/CREDIT.txt is a
@@ -1778,8 +1840,8 @@ class VideoAgent:
             credit = credit_path.read_text().strip()
             if credit and credit not in metadata.get("description", ""):
                 metadata["description"] = f"{metadata.get('description', '').rstrip()}\n\n{credit}"
-                metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
 
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
         return metadata
 
     async def _generate_effects(

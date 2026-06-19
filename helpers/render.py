@@ -2,14 +2,15 @@
 """
 EDL JSON → final.mp4 via FFmpeg.
 
-Pipeline per Hard Rules:
-  1. Per-segment extract with lossless -c copy
-  2. Grade each segment (grade.py)
-  3. Concat graded segments
-  4. Add voiceover/audio
-  5. 30ms audio fades at every boundary
-  6. Overlay animations (PTS-shifted)
-  7. Burn subtitles LAST (Rule 1)
+Pipeline per Hard Rules (optimized: collapsed encode passes):
+  1. Per-segment extract + grade + normalize in ONE encode pass
+     (was 3 separate passes: extract → grade → normalize)
+  2. Audio fades only for Workflow B (native audio kept); skipped in Workflow A
+  3. Concat graded segments (lossless -c copy, all same format now)
+  4. Overlay animations (PTS-shifted)
+  5. Attach voiceover (Workflow A) / keep native audio (Workflow B)
+  6. Background music
+  7. Burn subtitles LAST (Rule 1) — only remaining re-encode
 
 Usage:
     python helpers/render.py outputs/edit/edl.json --output outputs/edit/preview.mp4
@@ -161,13 +162,17 @@ def extract_segment(
     end: float,
     out_path: Path,
     pad_ms: int = 30,
+    grade_filter: str = "",
+    resolution: str = "1920x1080",
 ) -> Path:
-    """Segment extract with padding (Rule 7). Clamps timestamps to source duration to
-    handle wrong EDL offsets.
-    Re-encodes (not -c copy): some downloaded stock sources are VFR or have sparse
-    keyframes, which makes -ss/-t duration on a stream-copy unreliable (observed: -t
-    silently producing ~2x the requested length). Re-encoding with explicit CFR makes
-    seek/duration exact at the cost of one extra encode pass per segment."""
+    """Extract + grade + normalize in a SINGLE encode pass.
+
+    Combines what was previously 3 separate FFmpeg invocations (extract → grade → normalize)
+    into one. Applies: seek/trim, CFR re-encode, scale/pad, grade filter, fps lock.
+
+    Rule 7: padding at cut edges.
+    Rule 2: CFR re-encode at extract time (VFR/sparse-keyframe stock sources need it).
+    """
     src_dur = get_duration(source_path)
     if src_dur > 0:
         # Clamp: if start beyond source, use proportional position
@@ -182,17 +187,29 @@ def extract_segment(
     padded_start = max(0.0, start - pad_ms / 1000)
     duration = max(0.5, (end + pad_ms / 1000) - padded_start)
 
+    # Build unified video filter: normalize (scale+pad+fps) + grade in one pass
+    w, h = resolution.split("x")
+    vf_parts = [
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease",
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
+        "fps=30",
+        "setsar=1",
+    ]
+    if grade_filter:
+        vf_parts.append(grade_filter)
+    vf = ",".join(vf_parts)
+
     run([
         "ffmpeg", "-y",
         "-ss", str(padded_start),
         "-i", source_path,
         "-t", str(duration),
-        "-r", "30",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-vf", vf,
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
         "-avoid_negative_ts", "make_zero",
         str(out_path),
-    ], f"extract {Path(source_path).name} [{start:.2f}-{end:.2f}]")
+    ], f"extract+grade {Path(source_path).name} [{start:.2f}-{end:.2f}]")
     return out_path
 
 
@@ -285,6 +302,49 @@ def add_overlay(
     return out_path
 
 
+def add_end_screen(video_path: Path, out_path: Path, duration_s: float = 8.0) -> Path:
+    """Add a subscribe/end-card overlay in the last N seconds of the video.
+
+    YouTube's algorithm rewards sessions (viewer watches another video after yours).
+    The end screen shows two placeholder boxes where YouTube can place interactive
+    end screen elements (configured in YouTube Studio after upload), plus a subscribe
+    reminder. This is purely visual — the actual clickable end screen is added via
+    YouTube Studio, but the visual guides viewers' eyes to the right spots.
+    """
+    total_dur = get_duration(str(video_path))
+    if total_dur <= 0 or total_dur < duration_s + 5:
+        return video_path  # video too short for end screen
+
+    start_time = total_dur - duration_s
+    brand_label = os.getenv("THUMBNAIL_BRAND_LABEL", "DIA LY 60S")
+
+    # Draw end screen overlay using FFmpeg drawbox + drawtext
+    # Two rounded suggestion boxes (where YouTube end screen elements will go)
+    # + subscribe text
+    end_filter = (
+        # Dim background slightly in end screen zone
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.35:t=fill:enable='gte(t,{start_time:.2f})',"
+        # Left suggestion box (for "next video")
+        f"drawbox=x=iw*0.08:y=ih*0.25:w=iw*0.38:h=ih*0.45:color=white@0.12:t=fill:enable='gte(t,{start_time:.2f})',"
+        f"drawbox=x=iw*0.08:y=ih*0.25:w=iw*0.38:h=ih*0.45:color=white@0.5:t=3:enable='gte(t,{start_time:.2f})',"
+        # Right suggestion box (for "best for viewer")
+        f"drawbox=x=iw*0.54:y=ih*0.25:w=iw*0.38:h=ih*0.45:color=white@0.12:t=fill:enable='gte(t,{start_time:.2f})',"
+        f"drawbox=x=iw*0.54:y=ih*0.25:w=iw*0.38:h=ih*0.45:color=white@0.5:t=3:enable='gte(t,{start_time:.2f})',"
+        # Subscribe CTA at bottom
+        f"drawtext=text='SUBSCRIBE {brand_label}':fontsize=36:fontcolor=white:"
+        f"borderw=3:bordercolor=black@0.8:"
+        f"x=(w-tw)/2:y=h*0.82:enable='gte(t,{start_time:.2f})'"
+    )
+
+    run([
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vf", end_filter,
+        "-c:a", "copy",
+        str(out_path),
+    ], f"add end screen (last {duration_s}s)")
+    return out_path
+
+
 def burn_subtitles(video_path: Path, srt_path: str, out_path: Path) -> Path:
     """Burn subtitles LAST in filter chain (Rule 1)."""
     srt_abs = str(Path(srt_path).resolve())
@@ -361,6 +421,18 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
     overlays = edl.get("overlays", [])
     subtitles = edl.get("subtitles")
 
+    # Rule 6: validate EDL cuts against transcript word boundaries before rendering
+    try:
+        from helpers.edl_validator import validate_edl
+        # Look for transcript alongside output
+        transcript_dir = output_path.parent / "transcripts"
+        vo_transcript = transcript_dir / "voiceover.json"
+        if vo_transcript.exists():
+            edl = validate_edl(edl, vo_transcript)
+            ranges = edl.get("ranges", [])
+    except Exception as e:
+        print(f"[render] edl_validator skipped: {e}", file=sys.stderr)
+
     if not ranges:
         raise ValueError("EDL has no ranges")
 
@@ -386,7 +458,24 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
             local_sources[name] = url
     sources = local_sources
 
-    # Step 1: Extract + fade each segment
+    # Determine if this is Workflow A (voiceover replaces all segment audio).
+    # If so, skip per-segment audio fades — they're wasted work since voiceover
+    # becomes the sole audio track (Rule 3 only matters for Workflow B native audio).
+    voiceover = edl.get("voiceover")
+    if not voiceover:
+        auto_vo = output_path.parent / "voiceover.mp3"
+        if auto_vo.exists():
+            voiceover = str(auto_vo)
+    is_workflow_a = bool(voiceover and Path(voiceover).exists())
+
+    # Resolve grade filter once (used in single-pass extract+grade)
+    from helpers.grade import GRADE_PRESETS
+    if grade_preset in GRADE_PRESETS:
+        grade_filter = GRADE_PRESETS[grade_preset]
+    else:
+        grade_filter = grade_preset if grade_preset and grade_preset != "none" else ""
+
+    # Step 1: Extract + grade + normalize in ONE pass per segment
     segment_paths = []
     for i, r in enumerate(ranges):
         source_name = r["source"]
@@ -395,42 +484,37 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
             print(f"[render] skip range {i}: source '{source_name}' missing", file=sys.stderr)
             continue
 
-        raw_clip = work_dir / f"clip_{i:03d}_raw.mp4"
-        faded_clip = clips_dir / f"clip_{i:03d}.mp4"
+        graded_clip = clips_dir / f"clip_{i:03d}.mp4"
 
         try:
-            extract_segment(source_file, r["start"], r["end"], raw_clip, pad_ms=r.get("pad_ms", 30))
+            extract_segment(
+                source_file, r["start"], r["end"], graded_clip,
+                pad_ms=r.get("pad_ms", 30),
+                grade_filter=grade_filter,
+                resolution=resolution,
+            )
         except RuntimeError as e:
             print(f"[render] extract failed for range {i} ({source_name}): {e}", file=sys.stderr)
             continue
 
-        if not raw_clip.exists() or raw_clip.stat().st_size < 1000:
+        if not graded_clip.exists() or graded_clip.stat().st_size < 1000:
             print(f"[render] clip_{i:03d} empty/missing after extract, skip", file=sys.stderr)
             continue
 
-        try:
-            faded_clip = add_audio_fades(raw_clip, faded_clip)
-        except Exception:
-            faded_clip = raw_clip  # use without fades if fails
-        segment_paths.append(faded_clip)
+        # Audio fades only for Workflow B (native camera audio kept)
+        if not is_workflow_a:
+            faded_clip = clips_dir / f"clip_{i:03d}_faded.mp4"
+            try:
+                graded_clip = add_audio_fades(graded_clip, faded_clip)
+            except Exception:
+                pass  # use without fades if fails
+
+        segment_paths.append(graded_clip)
 
     if not segment_paths:
         raise ValueError("No valid segments extracted — check EDL sources are accessible")
 
-    # Step 2: Grade + normalize each segment (fps/res must match before concat)
-    from helpers.grade import grade_segment
-    graded_paths = []
-    for i, clip in enumerate(segment_paths):
-        graded = clips_dir / f"clip_{i:03d}_graded.mp4"
-        try:
-            grade_segment(clip, grade_preset or "none", graded, resolution=resolution)
-            graded_paths.append(graded)
-        except Exception as e:
-            print(f"[render] grade failed for {clip.name}: {e}, using ungraded", file=sys.stderr)
-            graded_paths.append(clip)
-    segment_paths = graded_paths
-
-    # Step 3: Concat
+    # Step 2: Concat
     # Debug: verify segments exist and have size
     valid_segments = []
     for p in segment_paths:
@@ -447,7 +531,7 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
     concat_segments(segment_paths, concat_out)
     current = concat_out
 
-    # Step 4: Overlays (Rule 4 — PTS shifted)
+    # Step 3: Overlays (Rule 4 — PTS shifted)
     for j, overlay in enumerate(overlays):
         overlay_out = work_dir / f"overlay_{j}.mp4"
         # style_version 3 = local semantic effects (cut_flash/lower_accent): transparent
@@ -463,14 +547,8 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
             mode=mode,
         )
 
-    # Step 5: Mix voiceover audio (if present in EDL or auto-detected)
-    voiceover = edl.get("voiceover")
-    if not voiceover:
-        # Auto-detect voiceover next to edl.json
-        auto_vo = output_path.parent / "voiceover.mp3"
-        if auto_vo.exists():
-            voiceover = str(auto_vo)
-    if voiceover and Path(voiceover).exists():
+    # Step 4: Attach voiceover (Workflow A) — already resolved above
+    if is_workflow_a:
         voiceover_duration = get_duration(str(voiceover))
         matched = work_dir / "matched_to_voiceover.mp4"
         current = match_video_duration(current, voiceover_duration, matched)
@@ -493,7 +571,7 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
         ], "attach voiceover")
         current = voiced
 
-    # Step 5b: Background music under voiceover
+    # Step 5: Background music under voiceover
     music_out = work_dir / "with_music.mp4"
     try:
         mixed_music = mix_background_music(current, music_out)
@@ -502,7 +580,18 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
     except Exception as e:
         print(f"[render] music mix skipped: {e}", file=sys.stderr)
 
-    # Step 6: Burn subtitles LAST (Rule 1)
+    # Step 6: End screen overlay (before subtitles — Rule 1 still last)
+    skip_end_screen = os.getenv("SKIP_END_SCREEN", "").lower() in ("1", "true")
+    if not skip_end_screen:
+        end_screen_out = work_dir / "with_endscreen.mp4"
+        try:
+            result = add_end_screen(current, end_screen_out)
+            if result.exists() and result.stat().st_size > 10000:
+                current = result
+        except Exception as e:
+            print(f"[render] end screen skipped: {e}", file=sys.stderr)
+
+    # Step 7: Burn subtitles LAST (Rule 1) — only re-encode left in chain
     if subtitles and Path(subtitles).exists():
         subbed = work_dir / "with_subs.mp4"
         burn_subtitles(current, subtitles, subbed)
