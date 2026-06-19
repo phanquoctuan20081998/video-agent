@@ -11,7 +11,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -31,6 +31,9 @@ SEED_QUERIES = [
     "geopolitics geography explained",
     "địa lý thế giới vì sao",
 ]
+
+REDDIT_SUBREDDITS = ["geography", "MapPorn", "geopolitics"]
+GOOGLE_TRENDS_GEOS = ["VN", "US"]
 
 
 @dataclass
@@ -163,13 +166,22 @@ class GeographyAutopilot:
         )
 
     async def _collect_trend_context(self) -> str:
+        cached = self._load_cached_trend_context()
+        if cached:
+            self.logger.info("[autopilot] using cached trend context")
+            return cached
+
         blocks: list[str] = []
-        for query in SEED_QUERIES:
+        query_limit = max(0, min(len(SEED_QUERIES), config.settings.autopilot_trend_query_limit))
+        for query in SEED_QUERIES[:query_limit]:
             try:
                 results = await self.content_searcher.search_topic_on_youtube(query, max_results=6)
             except Exception as e:
                 self.logger.warning(f"[autopilot] trend query failed for '{query}': {e}")
                 results = []
+            if self.content_searcher.youtube_quota_exceeded:
+                self.logger.warning("[autopilot] YouTube search quota exceeded; stopping live trend search")
+                break
             if not results:
                 continue
             lines = [f"Query: {query}"]
@@ -178,9 +190,61 @@ class GeographyAutopilot:
                     f"- {item.title} | views={item.views} | likes={item.likes} | url={item.url}"
                 )
             blocks.append("\n".join(lines))
+
+        # Google Trends — what people are actually searching right now (no key needed).
+        for geo in GOOGLE_TRENDS_GEOS:
+            try:
+                terms = await self.content_searcher.fetch_google_trends(geo=geo, max_results=15)
+            except Exception as e:
+                self.logger.warning(f"[autopilot] Google Trends fetch failed for geo={geo}: {e}")
+                terms = []
+            if terms:
+                blocks.append(f"Google Trends (geo={geo}):\n" + ", ".join(terms))
+
+        # Reddit hot posts — social-media signal for what's resonating right now.
+        for subreddit in REDDIT_SUBREDDITS:
+            try:
+                results = await self.content_searcher.search_reddit_hot(subreddit, max_results=8)
+            except Exception as e:
+                self.logger.warning(f"[autopilot] Reddit fetch failed for r/{subreddit}: {e}")
+                results = []
+            if not results:
+                continue
+            lines = [f"Reddit r/{subreddit}:"]
+            for item in results[:8]:
+                lines.append(f"- {item.title} | score={item.likes} | url={item.url}")
+            blocks.append("\n".join(lines))
+
         if not blocks:
             return "No live trend context available. Generate evergreen geography ideas for Vietnam-facing viewers."
-        return "\n\n".join(blocks)
+        context = "\n\n".join(blocks)
+        self._save_cached_trend_context(context)
+        return context
+
+    def _trend_cache_path(self) -> Path:
+        return self.base_dir / "trend_context_cache.json"
+
+    def _load_cached_trend_context(self) -> Optional[str]:
+        path = self._trend_cache_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+            created_at = datetime.fromisoformat(data.get("created_at", ""))
+            ttl = timedelta(hours=max(0, config.settings.autopilot_trend_cache_hours))
+            if ttl.total_seconds() <= 0 or datetime.now() - created_at > ttl:
+                return None
+            context = data.get("context")
+            return context if isinstance(context, str) and context.strip() else None
+        except Exception as e:
+            self.logger.warning(f"[autopilot] trend cache invalid: {e}")
+            return None
+
+    def _save_cached_trend_context(self, context: str) -> None:
+        self._trend_cache_path().write_text(json.dumps({
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "context": context,
+        }, indent=2, ensure_ascii=False))
 
     def _generate_topic_candidates(self, trend_context: str, state: dict[str, Any]) -> list[dict[str, Any]]:
         candidates_path = self.base_dir / "latest_topic_candidates.json"

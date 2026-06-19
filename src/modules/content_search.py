@@ -3,6 +3,7 @@ Trending Content Search Module
 """
 
 import httpx
+import re
 from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel
@@ -27,6 +28,17 @@ class ContentSearcher:
     
     def __init__(self):
         self.logger = logger
+        self.youtube_quota_exceeded = False
+
+    @staticmethod
+    def _safe_api_error(error: Exception) -> str:
+        text = str(error)
+        text = re.sub(r"([?&]key=)[^&\s]+", r"\1<redacted>", text)
+        if "Quota exceeded" in text:
+            return "YouTube API quota exceeded for search queries"
+        if len(text) > 500:
+            text = f"{text[:500]}..."
+        return text
     
     async def search_youtube_trending(
         self,
@@ -83,43 +95,101 @@ class ContentSearcher:
             return sorted(results, key=lambda x: x.trending_score, reverse=True)
             
         except Exception as e:
-            self.logger.error(f"Error searching YouTube trending: {e}")
+            message = self._safe_api_error(e)
+            if "quota exceeded" in message.lower():
+                self.youtube_quota_exceeded = True
+                self.logger.warning(f"Error searching YouTube trending: {message}")
+            else:
+                self.logger.error(f"Error searching YouTube trending: {message}")
             return []
     
-    async def search_tiktok_trending(
+    async def fetch_google_trends(self, geo: str = "VN", max_results: int = 20) -> list[str]:
+        """Fetch today's trending search terms from Google Trends' public RSS feed.
+        No API key needed. Returns plain search terms (not full TrendingContent —
+        this feed has no view/like counts, just what people are searching right now)."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    "https://trends.google.com/trending/rss",
+                    params={"geo": geo},
+                )
+                resp.raise_for_status()
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(resp.text)
+                terms = [
+                    item.findtext("title", default="").strip()
+                    for item in root.findall(".//item")
+                ]
+                terms = [t for t in terms if t][:max_results]
+                self.logger.info(f"Found {len(terms)} Google Trends terms for geo={geo}")
+                return terms
+        except Exception as e:
+            self.logger.warning(f"Error fetching Google Trends for geo={geo}: {e}")
+            return []
+
+    async def search_reddit_hot(
         self,
-        keywords: Optional[list[str]] = None,
+        subreddit: str,
         max_results: int = 10
     ) -> List[TrendingContent]:
-        """
-        Search TikTok trending videos
-        Uses web scraping (requires selenium)
-        """
-        try:
-            from selenium import webdriver
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            
-            driver = webdriver.Chrome()
-            driver.get("https://www.tiktok.com/discover")
-            
-            # Wait for content to load
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_all_elements_located((By.CLASS_NAME, "video-feed-item"))
-            )
-            
-            results = []
-            # Extract trending content (simplified)
-            # In production, use proper TikTok API
-            
-            driver.quit()
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Error searching TikTok trending: {e}")
+        """Fetch hot posts from a subreddit via Reddit's app-only OAuth flow.
+        Requires REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET (free, create a "script"
+        app at reddit.com/prefs/apps)."""
+        from src.core import config
+
+        client_id = config.settings.reddit_client_id
+        client_secret = config.settings.reddit_client_secret
+        if not client_id or not client_secret:
+            self.logger.debug("Reddit credentials not configured; skipping")
             return []
-    
+
+        user_agent = "video-agent-trend-research/1.0"
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                token_resp = await client.post(
+                    "https://www.reddit.com/api/v1/access_token",
+                    data={"grant_type": "client_credentials"},
+                    auth=(client_id, client_secret),
+                    headers={"User-Agent": user_agent},
+                )
+                token_resp.raise_for_status()
+                access_token = token_resp.json().get("access_token")
+                if not access_token:
+                    return []
+
+                posts_resp = await client.get(
+                    f"https://oauth.reddit.com/r/{subreddit}/hot",
+                    params={"limit": max_results},
+                    headers={
+                        "Authorization": f"bearer {access_token}",
+                        "User-Agent": user_agent,
+                    },
+                )
+                posts_resp.raise_for_status()
+                children = posts_resp.json().get("data", {}).get("children", [])
+
+                results = []
+                for child in children:
+                    post = child.get("data", {})
+                    if post.get("stickied"):
+                        continue
+                    results.append(TrendingContent(
+                        title=post.get("title", ""),
+                        description=(post.get("selftext") or "")[:200],
+                        views=int(post.get("view_count") or 0),
+                        likes=int(post.get("score") or 0),
+                        keywords=[subreddit],
+                        url=f"https://reddit.com{post.get('permalink', '')}",
+                        source="reddit",
+                        category=subreddit,
+                        trending_score=float(post.get("score") or 0) * (1 + float(post.get("upvote_ratio") or 0)),
+                    ))
+                self.logger.info(f"Found {len(results)} hot posts on r/{subreddit}")
+                return results
+        except Exception as e:
+            self.logger.warning(f"Error fetching Reddit hot posts for r/{subreddit}: {e}")
+            return []
+
     async def search_topic_on_youtube(
         self,
         topic: str,
@@ -181,5 +251,10 @@ class ContentSearcher:
             return results
             
         except Exception as e:
-            self.logger.error(f"Error searching YouTube by topic: {e}")
+            message = self._safe_api_error(e)
+            if "quota exceeded" in message.lower():
+                self.youtube_quota_exceeded = True
+                self.logger.warning(f"Error searching YouTube by topic '{topic}': {message}")
+            else:
+                self.logger.error(f"Error searching YouTube by topic '{topic}': {message}")
             return []

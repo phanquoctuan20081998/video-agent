@@ -29,6 +29,10 @@ class AppSettings(BaseSettings):
     # YouTube API
     youtube_client_id: str = Field(default="", alias="YOUTUBE_CLIENT_ID")
     youtube_client_secret: str = Field(default="", alias="YOUTUBE_CLIENT_SECRET")
+
+    # Reddit API (trend research)
+    reddit_client_id: str = Field(default="", alias="REDDIT_CLIENT_ID")
+    reddit_client_secret: str = Field(default="", alias="REDDIT_CLIENT_SECRET")
     youtube_developer_key: str = Field(default="", alias="YOUTUBE_DEVELOPER_KEY")
     
     # Stock Video APIs
@@ -74,6 +78,8 @@ class AppSettings(BaseSettings):
     # Autopilot / review workflow
     autopilot_duration_s: int = Field(default=75, alias="AUTOPILOT_DURATION_S")
     autopilot_mode: str = Field(default="edl", alias="AUTOPILOT_MODE")
+    autopilot_trend_query_limit: int = Field(default=2, alias="AUTOPILOT_TREND_QUERY_LIMIT")
+    autopilot_trend_cache_hours: int = Field(default=12, alias="AUTOPILOT_TREND_CACHE_HOURS")
     autopilot_review_email_to: str = Field(default="", alias="AUTOPILOT_REVIEW_EMAIL_TO")
     autopilot_review_email_from: str = Field(default="", alias="AUTOPILOT_REVIEW_EMAIL_FROM")
     smtp_host: str = Field(default="", alias="SMTP_HOST")
