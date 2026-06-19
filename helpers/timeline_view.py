@@ -19,6 +19,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -142,38 +143,51 @@ def view_cut_boundary(
     return {"filmstrip": filmstrip, "waveform": waveform}
 
 
-def view_from_edl(video: str, edl_path: str, out_dir: Path, window: float = 3.0):
-    """Check all cut boundaries from EDL file."""
-    edl = json.loads(Path(edl_path).read_text())
+def compute_cut_times_from_edl(edl: dict) -> list[tuple[float, str, Optional[int]]]:
+    """Cut boundary times in output timeline from an EDL's ranges, plus first/last/mid
+    checkpoints. range_index = the range that STARTS at this boundary (None for
+    end-of-video / midpoint checkpoints). Shared by view_from_edl (PNG generation) and
+    self_eval.py (issue evaluation) so the boundary math can't drift between the two."""
     ranges = edl.get("ranges", [])
 
-    # Build list of cut times in output timeline
-    cut_times = []
+    cut_times: list[tuple[float, str, Optional[int]]] = []
     cursor = 0.0
-    for r in ranges:
+    for i, r in enumerate(ranges):
         duration = r["end"] - r["start"]
-        # Start of segment in output
-        cut_times.append((cursor, f"{r.get('beat', '')}_{r.get('source', '')}"))
-        # End of segment in output
+        cut_times.append((cursor, f"{r.get('beat', '')}_{r.get('source', '')}", i))
         cursor += duration
-        cut_times.append((cursor, f"end_{r.get('beat', '')}"))
+        next_idx = i + 1 if i + 1 < len(ranges) else None
+        cut_times.append((cursor, f"end_{r.get('beat', '')}", next_idx))
 
-    # Also check first 2s, last 2s, 2-3 mid-points
     total = cursor
-    checkpoints = [
-        (2.0, "first_2s"),
-        (max(0, total - 2.0), "last_2s"),
-        (total / 2, "midpoint"),
+    checkpoints: list[tuple[float, str, Optional[int]]] = [
+        (2.0, "first_2s", 0 if ranges else None),
+        (max(0, total - 2.0), "last_2s", len(ranges) - 1 if ranges else None),
+        (total / 2, "midpoint", None),
     ]
-    all_checks = cut_times + checkpoints
+    return [(ts, label, idx) for ts, label, idx in cut_times + checkpoints if 0 <= ts <= total]
+
+
+def view_from_edl(video: str, edl_path: str, out_dir: Path, window: float = 3.0):
+    """Check all cut boundaries from EDL file. Writes manifest.json (list of
+    {time, label, range_index, filmstrip, waveform}) for programmatic self-eval."""
+    edl = json.loads(Path(edl_path).read_text())
+    all_checks = compute_cut_times_from_edl(edl)
 
     print(f"[timeline] checking {len(all_checks)} points in {video}", file=sys.stderr)
-    for ts, label in all_checks:
-        if ts < 0 or ts > total:
-            continue
-        view_cut_boundary(video, ts, window, out_dir, label)
+    manifest = []
+    for ts, label, range_index in all_checks:
+        result = view_cut_boundary(video, ts, window, out_dir, label)
+        manifest.append({
+            "time": ts,
+            "label": label,
+            "range_index": range_index,
+            "filmstrip": str(result["filmstrip"]),
+            "waveform": str(result["waveform"]),
+        })
         print(f"[timeline] ✓ {label} @ {ts:.2f}s", file=sys.stderr)
 
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"[timeline] PNGs written to {out_dir}", file=sys.stderr)
 
 

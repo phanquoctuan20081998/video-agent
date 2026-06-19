@@ -3,6 +3,7 @@ CLI Interface for Video Agent
 """
 
 import asyncio
+from pathlib import Path
 import click
 from loguru import logger
 
@@ -256,6 +257,76 @@ def test_api():
     except Exception as e:
         click.secho(f"Error: {e}", fg="red")
         exit(1)
+
+
+@cli.group()
+def autopilot():
+    """Geography-channel autopilot commands"""
+    pass
+
+
+@autopilot.command("doctor")
+def autopilot_doctor():
+    """Check autopilot configuration"""
+    checks = [
+        ("OPENROUTER_API_KEY", bool(config.settings.openrouter_api_key)),
+        ("ELEVENLABS_API_KEY", bool(config.settings.elevenlabs_api_key)),
+        ("PEXELS_API_KEY or PIXABAY_API_KEY", bool(config.settings.pexels_api_key or config.settings.pixabay_api_key)),
+        ("YOUTUBE_DEVELOPER_KEY", bool(config.settings.youtube_developer_key)),
+        ("YouTube OAuth files", Path("youtube_oauth.json").exists() or Path("youtube_token.pickle").exists()),
+        ("SMTP_HOST", bool(config.settings.smtp_host)),
+        ("AUTOPILOT_REVIEW_EMAIL_TO", bool(config.settings.autopilot_review_email_to)),
+        ("AUTOPILOT_REVIEW_EMAIL_FROM", bool(config.settings.autopilot_review_email_from)),
+    ]
+    for label, ok in checks:
+        click.echo(f"{'✓' if ok else '✗'} {label}")
+
+
+@autopilot.command("run")
+@click.option("--slot", default="manual", show_default=True, help="Run slot label: morning/evening/manual")
+@click.option("--duration", type=int, default=None, help="Override target duration in seconds")
+@click.option("--mode", type=click.Choice(["edl", "hybrid", "storyboard"]), default=None, help="Override pipeline mode")
+@click.option("--dry-run", is_flag=True, help="Research/select a topic and email manifest without generating/uploading")
+def autopilot_run(slot, duration, mode, dry_run):
+    """Run one full geography autopilot cycle"""
+    config.create_dirs()
+    logger.remove()
+    logger.add("logs/autopilot.log", rotation="200 MB", retention="14 days", level=config.settings.log_level)
+    logger.add(lambda msg: click.echo(msg, err=True), level=config.settings.log_level)
+
+    async def _run():
+        from src.modules.geography_autopilot import GeographyAutopilot
+
+        agent = GeographyAutopilot()
+        return await agent.run_once(slot=slot, duration=duration, mode=mode, dry_run=dry_run)
+
+    try:
+        result = asyncio.run(_run())
+        click.secho(f"✓ Autopilot run: {result.run_id}", fg="green")
+        click.echo(f"Topic: {result.topic}")
+        click.echo(f"Video: {result.video_path}")
+        click.echo(f"YouTube: {result.youtube_url}")
+        click.echo(f"Manifest: {result.manifest_path}")
+    except Exception as e:
+        logger.error(f"Autopilot failed: {e}")
+        click.secho(f"Autopilot failed: {e}", fg="red")
+        exit(1)
+
+
+@autopilot.command("write-launchd")
+@click.option("--output", type=click.Path(), default="outputs/autopilot/com.videoagent.geography-autopilot.plist", show_default=True)
+def autopilot_write_launchd(output):
+    """Write a launchd plist that runs at 06:00 and 17:00"""
+    from src.modules.geography_autopilot import launchd_plist
+
+    repo_dir = Path.cwd()
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(launchd_plist(repo_dir))
+    click.secho(f"✓ Wrote {out_path}", fg="green")
+    click.echo("Install on macOS with:")
+    click.echo(f"  cp {out_path} ~/Library/LaunchAgents/com.videoagent.geography-autopilot.plist")
+    click.echo("  launchctl load ~/Library/LaunchAgents/com.videoagent.geography-autopilot.plist")
 
 
 if __name__ == "__main__":

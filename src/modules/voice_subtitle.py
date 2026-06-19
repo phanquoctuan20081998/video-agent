@@ -76,7 +76,11 @@ class VoiceoverGenerator:
                     "similarity_boost": 0.75
                 }
             }
-            if language_code:
+            # language_code is only honored by Turbo v2.5 / Flash v2.5 — other models
+            # (including the eleven_multilingual_v2 default) return 400 Bad Request
+            # if it's present at all, even when set to a valid code.
+            LANGUAGE_CODE_MODELS = {"eleven_turbo_v2_5", "eleven_flash_v2_5"}
+            if language_code and model_id in LANGUAGE_CODE_MODELS:
                 data["language_code"] = language_code
             
             if not output_path:

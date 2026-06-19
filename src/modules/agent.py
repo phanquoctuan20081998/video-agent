@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import hashlib
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -23,7 +24,7 @@ from loguru import logger
 
 from src.core import OpenRouterLLM, LLMConfig, LLMMessage, config
 from src.modules.content_search import ContentSearcher
-from src.modules.video_fetcher import StockVideoFetcher
+from src.modules.video_fetcher import StockVideo, StockVideoFetcher
 from src.modules.youtube_uploader import YouTubeUploader
 
 
@@ -60,6 +61,8 @@ class VideoAgent:
     """
 
     MAX_SELF_EVAL_PASSES = 3
+    EDL_CACHE_VERSION = "edl_stock_visual_match_v3"
+    OVERLAY_CACHE_VERSION = "map_label_dedupe_v2"
     RENDER_CACHE_VERSION = "edl_music_mix_v2"
 
     def __init__(self):
@@ -135,13 +138,19 @@ class VideoAgent:
 
         # ── Step 1: Concept ───────────────────────────────────────────────────
         concept_path = work_dir / "concept.json"
-        if done(concept_path):
+        concept_fingerprint = self._artifact_fingerprint({
+            "step": "concept",
+            "topic": planning_topic,
+            "duration": duration,
+        })
+        if done(concept_path) and self._artifact_cache_fresh(concept_path, concept_fingerprint):
             self.logger.info("[agent] ✓ concept (cached)")
             concept = json.loads(concept_path.read_text())
         else:
             concept = await self._generate_concept(planning_topic, duration, session)
             if not concept:
                 return None
+            self._write_artifact_cache(concept_path, concept_fingerprint)
 
         if stop_at == "concept":
             self.logger.info(f"[agent] stop_at=concept → {concept_path}")
@@ -152,26 +161,48 @@ class VideoAgent:
 
         # ── Step 2: Script ────────────────────────────────────────────────────
         script_path = work_dir / "script.txt"
-        if done(script_path):
+        script_fingerprint = self._artifact_fingerprint({
+            "step": "script",
+            "concept": concept,
+            "duration": duration,
+        })
+        if done(script_path) and self._artifact_cache_fresh(script_path, script_fingerprint):
             self.logger.info("[agent] ✓ script (cached)")
             script = self._extract_script_text(script_path.read_text())
             script_path.write_text(script)  # rewrite clean in case cache has old JSON
+            self._write_artifact_cache(script_path, script_fingerprint)
         else:
             script = await self._generate_script(concept, duration, session)
             if not script:
                 return None
+            self._write_artifact_cache(script_path, script_fingerprint)
 
         if stop_at == "script":
             self.logger.info(f"[agent] stop_at=script → {script_path}")
             return str(script_path)
 
+        # Storyboard mode has its own voiceover/assembly path and does not use
+        # EDL stock search or transcript packing. Branch early to avoid wasted API work.
+        if mode == "storyboard":
+            return await self._storyboard_workflow(
+                concept, script, duration, work_dir, session,
+                auto_upload=auto_upload,
+            )
+
         # ── Step 2b: Per-sentence search terms (audio-matched stock diversity) ──
         search_terms_path = work_dir / "search_terms.json"
-        if done(search_terms_path):
+        search_terms_fingerprint = self._artifact_fingerprint({
+            "step": "search_terms",
+            "script": script,
+            "concept": concept,
+        })
+        if done(search_terms_path) and self._artifact_cache_fresh(search_terms_path, search_terms_fingerprint):
             self.logger.info("[agent] ✓ search terms (cached)")
             per_sentence_terms = json.loads(search_terms_path.read_text())
         else:
             per_sentence_terms = await self._generate_search_terms(script, concept, work_dir)
+            if search_terms_path.exists():
+                self._write_artifact_cache(search_terms_path, search_terms_fingerprint)
 
         if stop_at == "terms":
             self.logger.info(f"[agent] stop_at=terms → {search_terms_path}")
@@ -185,11 +216,11 @@ class VideoAgent:
             sentence_keywords = list(dict.fromkeys(
                 item.get("search_term", "") for item in per_sentence_terms if item.get("search_term")
             ))
-            # Supplement with concept keywords for coverage
-            concept_keywords = list(dict.fromkeys([*keywords, *concept.get("keywords", [topic])]))
-            all_keywords = list(dict.fromkeys(sentence_keywords + concept_keywords))[:25]
+            # concept["keywords"] are SEO terms for YouTube metadata (often in the topic's own
+            # language, e.g. Vietnamese) — wrong tool for stock search, which needs concrete
+            # English visual phrases. Don't mix them into the stock-search pool.
+            all_keywords = list(dict.fromkeys(sentence_keywords + list(keywords)))[:25]
         else:
-            concept_keywords = list(dict.fromkeys([*keywords, *concept.get("keywords", [topic])]))
             visual_keywords = [
                 "satellite map", "world map animation", "aerial landscape",
                 "city timelapse", "people market", "mountains river",
@@ -197,7 +228,7 @@ class VideoAgent:
                 "rural village life", "industrial factory", "ocean coastline",
                 "desert landscape", "forest canopy", "busy street crowd",
             ]
-            all_keywords = list(dict.fromkeys(concept_keywords + visual_keywords))[:20]
+            all_keywords = list(dict.fromkeys(list(keywords) + visual_keywords))[:20]
 
         clips_per_keyword = 4
         stock_videos = await self._fetch_stock_videos(
@@ -240,16 +271,11 @@ class VideoAgent:
                 auto_upload=auto_upload,
             )
 
-        # ── Storyboard branch (animation pipeline) ────────────────────────────
-        if mode == "storyboard":
-            return await self._storyboard_workflow(
-                concept, script, duration, work_dir, session,
-                auto_upload=auto_upload,
-            )
-
         # ── Step 6: EDL ───────────────────────────────────────────────────────
         edl_path = work_dir / "edl.json"
-        if fresh(edl_path, [packed_md], min_bytes=10):
+        stock_cache_path = work_dir / "stock_videos.json"
+        edl_deps = [packed_md, stock_cache_path]
+        if self._edl_fresh(edl_path, edl_deps):
             self.logger.info("[agent] ✓ EDL (cached)")
         else:
             edl_path = await self._generate_edl(packed_md, concept, stock_videos, work_dir)
@@ -257,12 +283,13 @@ class VideoAgent:
                 return None
         session.edl_path = str(edl_path)
 
-        # ── Step 6a: Map/stat overlay graphics (DISABLED — text overlays look cheap)
-        # overlays_dir = work_dir / "animations"
-        # if self._overlays_fresh(edl_path, overlays_dir):
-        #     self.logger.info("[agent] ✓ overlays (cached)")
-        # else:
-        #     await self._add_overlays_to_edl(script, concept, edl_path, overlays_dir)
+        # ── Step 6a: Map overlay graphics (map_highlight only — stat_card still looks
+        # cheap as a flat full-screen card, kept disabled until it gets a real redesign)
+        overlays_dir = work_dir / "animations"
+        if self._overlays_fresh(edl_path, overlays_dir):
+            self.logger.info("[agent] ✓ overlays (cached)")
+        else:
+            await self._add_overlays_to_edl(script, concept, edl_path, overlays_dir)
 
         # ── Step 6b: Optional effects ─────────────────────────────────────────
         if apply_effects:
@@ -308,7 +335,7 @@ class VideoAgent:
         # ── Step 9: Upload ────────────────────────────────────────────────────
         if auto_upload:
             metadata = await self._generate_seo(script, work_dir)
-            await self._upload(final_path, metadata)
+            await self._upload(final_path, metadata, concept=concept, topic=topic)
 
         self._persist_session(session)
         self.logger.info(f"[agent] Done: {final_path}")
@@ -390,6 +417,12 @@ class VideoAgent:
         def done(path: Path, min_bytes: int = 10) -> bool:
             return path.exists() and path.stat().st_size >= min_bytes
 
+        def fresh(path: Path, deps: list[Path], min_bytes: int = 10) -> bool:
+            if not done(path, min_bytes=min_bytes):
+                return False
+            output_mtime = path.stat().st_mtime
+            return all(not dep.exists() or output_mtime >= dep.stat().st_mtime for dep in deps)
+
         # Step S1: Voiceover
         voiceover_path = work_dir / "voiceover.mp3"
         if self._voiceover_fresh(voiceover_path, script):
@@ -402,7 +435,13 @@ class VideoAgent:
 
         # Step S2: Storyboard
         storyboard_path = work_dir / "storyboard.json"
-        if done(storyboard_path):
+        storyboard_fingerprint = self._artifact_fingerprint({
+            "step": "storyboard",
+            "script": script,
+            "concept": concept,
+            "duration": duration,
+        })
+        if done(storyboard_path) and self._artifact_cache_fresh(storyboard_path, storyboard_fingerprint):
             self.logger.info("[agent] ✓ storyboard (cached)")
         else:
             storyboard_path = await self._generate_storyboard(
@@ -411,11 +450,12 @@ class VideoAgent:
             if not storyboard_path:
                 self.logger.warning("[agent] storyboard failed, falling back to EDL mode")
                 return None
+            self._write_artifact_cache(storyboard_path, storyboard_fingerprint)
         session.storyboard_path = str(storyboard_path)
 
         # Step S3: Scene assembly (Remotion + AI images + Seedance)
         assembled_path = work_dir / "assembled.mp4"
-        if done(assembled_path, min_bytes=10000):
+        if fresh(assembled_path, [storyboard_path, voiceover_path], min_bytes=10000):
             self.logger.info("[agent] ✓ assembled scenes (cached)")
         else:
             try:
@@ -449,7 +489,7 @@ class VideoAgent:
         # Step S6: Upload
         if auto_upload:
             metadata = await self._generate_seo(script, work_dir)
-            await self._upload(final_path, metadata)
+            await self._upload(final_path, metadata, concept=concept, topic=session.topic)
 
         self._persist_session(session)
         self.logger.info(f"[agent] storyboard done: {final_path}")
@@ -476,8 +516,15 @@ class VideoAgent:
         def done(path: Path, min_bytes: int = 10) -> bool:
             return path.exists() and path.stat().st_size >= min_bytes
 
+        def fresh(path: Path, deps: list[Path], min_bytes: int = 10) -> bool:
+            if not done(path, min_bytes=min_bytes):
+                return False
+            output_mtime = path.stat().st_mtime
+            return all(not dep.exists() or output_mtime >= dep.stat().st_mtime for dep in deps)
+
         edl_path = work_dir / "edl.json"
-        if done(edl_path):
+        stock_cache_path = work_dir / "stock_videos.json"
+        if self._edl_fresh(edl_path, [packed_md, stock_cache_path]):
             self.logger.info("[agent] ✓ EDL (cached)")
         else:
             edl_path = await self._generate_edl(packed_md, concept, stock_videos, work_dir)
@@ -486,7 +533,17 @@ class VideoAgent:
         session.edl_path = str(edl_path)
 
         storyboard_path = work_dir / "storyboard.json"
-        if self._json_cache_valid(storyboard_path):
+        hybrid_storyboard_fingerprint = self._artifact_fingerprint({
+            "step": "hybrid_storyboard",
+            "script": script,
+            "concept": concept,
+            "duration": duration,
+            "edl": edl_path.read_text() if edl_path.exists() else "",
+        })
+        if (
+            self._json_cache_valid(storyboard_path)
+            and self._artifact_cache_fresh(storyboard_path, hybrid_storyboard_fingerprint)
+        ):
             self.logger.info("[agent] ✓ hybrid storyboard (cached)")
         else:
             storyboard_path = await self._generate_hybrid_storyboard(
@@ -494,10 +551,11 @@ class VideoAgent:
             )
             if not storyboard_path:
                 return None
+            self._write_artifact_cache(storyboard_path, hybrid_storyboard_fingerprint)
         session.storyboard_path = str(storyboard_path)
 
         assembled_path = work_dir / "assembled.mp4"
-        if done(assembled_path, min_bytes=10000):
+        if fresh(assembled_path, [storyboard_path, voiceover_path], min_bytes=10000):
             self.logger.info("[agent] ✓ assembled hybrid scenes (cached)")
         else:
             self._run_helper([
@@ -523,7 +581,7 @@ class VideoAgent:
 
         if auto_upload:
             metadata = await self._generate_seo(script, work_dir)
-            await self._upload(final_path, metadata)
+            await self._upload(final_path, metadata, concept=concept, topic=session.topic)
 
         self._persist_session(session)
         self.logger.info(f"[agent] hybrid done: {final_path}")
@@ -667,6 +725,32 @@ class VideoAgent:
         return json.loads(self._extract_json_text(path.read_text()))
 
     @staticmethod
+    def _artifact_fingerprint(payload: dict) -> str:
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _artifact_meta_path(path: Path) -> Path:
+        return path.with_name(f"{path.name}.meta.json")
+
+    def _artifact_cache_fresh(self, path: Path, fingerprint: str) -> bool:
+        meta_path = self._artifact_meta_path(path)
+        if not path.exists() or not meta_path.exists():
+            return False
+        if meta_path.stat().st_mtime < path.stat().st_mtime:
+            return False
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        return meta.get("fingerprint") == fingerprint
+
+    def _write_artifact_cache(self, path: Path, fingerprint: str) -> None:
+        self._artifact_meta_path(path).write_text(json.dumps({
+            "fingerprint": fingerprint,
+        }, indent=2))
+
+    @staticmethod
     def _extract_script_text(content: str) -> str:
         """Extract plain script text from raw LLM output (strips JSON wrapper + code fences)."""
         text = content.strip()
@@ -714,22 +798,40 @@ class VideoAgent:
     ) -> Optional[str]:
         concept_path = Path(session.work_dir) / "concept.json"
         script_path = Path(session.work_dir) / "script.txt"
+        draft_path = Path(session.work_dir) / "script.draft.txt"
         self._run_helper([
             "helpers/llm_task.py",
             "--task", "generate_script",
             "--input", str(concept_path),
             "--duration", str(int(duration)),
-            "--output", str(script_path),
+            "--output", str(draft_path),
         ], "generate script")
-        if not script_path.exists():
+        if not draft_path.exists():
             self.logger.error("[agent] script generation failed")
             return None
-        script = script_path.read_text().strip()
+        script = draft_path.read_text().strip()
         if not script:
             self.logger.error("[agent] script file is empty")
             return None
         # LLM now returns plain text — but defensively strip JSON wrapper if present
         script = self._extract_script_text(script)
+        draft_path.write_text(script)
+
+        try:
+            self._run_helper([
+                "helpers/llm_task.py",
+                "--task", "audit_script",
+                "--input", str(draft_path),
+                "--context", str(concept_path),
+                "--duration", str(int(duration)),
+                "--output", str(script_path),
+            ], "audit and correct script")
+            audited = self._extract_script_text(script_path.read_text().strip())
+            if audited:
+                script = audited
+        except Exception as e:
+            self.logger.warning(f"[agent] script audit failed; using generated draft: {e}")
+
         script_path.write_text(script)
         session.script = script
         return script
@@ -851,7 +953,9 @@ class VideoAgent:
             script_path = base_work_dir / "script.txt"
             script = script_path.read_text() if script_path.exists() else topic
             metadata = await self._generate_seo(script, base_work_dir)
-            await self._upload(final_path, metadata)
+            concept_path = base_work_dir / "concept.json"
+            concept = json.loads(concept_path.read_text()) if concept_path.exists() else {}
+            await self._upload(final_path, metadata, concept=concept, topic=topic)
 
         return str(final_path)
 
@@ -867,6 +971,7 @@ class VideoAgent:
 
         # Build context with source paths — pass ALL unique clips so LLM has more to work with
         sources = concept.get("sources", {})
+        stock_library = self._build_stock_library(stock_videos)
         if not sources and stock_videos:
             sources = {
                 f"stock_{i}": v.download_url or v.url
@@ -874,6 +979,7 @@ class VideoAgent:
             }
         context_path.write_text(json.dumps({
             "sources": sources,
+            "stock_library": stock_library[:15],
             "concept": concept,
         }, indent=2))
 
@@ -891,6 +997,281 @@ class VideoAgent:
 
         # Post-process: enforce round-robin source assignment so no clip repeats back-to-back
         edl_path = self._dedup_edl_sources(edl_path, sources)
+        edl_path = await self._repair_edl_stock_matches(edl_path, concept, stock_videos)
+        try:
+            edl = json.loads(edl_path.read_text())
+            edl["_cache_version"] = self.EDL_CACHE_VERSION
+            edl_path.write_text(json.dumps(edl, indent=2, ensure_ascii=False))
+        except Exception as e:
+            self.logger.warning(f"[agent] could not stamp EDL cache version: {e}")
+        return edl_path
+
+    def _edl_fresh(self, edl_path: Path, deps: list[Path]) -> bool:
+        if not edl_path.exists() or edl_path.stat().st_size < 10:
+            return False
+        output_mtime = edl_path.stat().st_mtime
+        if any(dep.exists() and output_mtime < dep.stat().st_mtime for dep in deps):
+            return False
+        try:
+            edl = json.loads(edl_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        return edl.get("_cache_version") == self.EDL_CACHE_VERSION
+
+    def _build_stock_library(self, stock_videos: list) -> list[dict]:
+        """Small metadata index used to match EDL quotes to stock clips."""
+        library = []
+        for i, video in enumerate(stock_videos):
+            library.append({
+                "id": f"stock_{i}",
+                "title": getattr(video, "title", ""),
+                "tags": getattr(video, "tags", []) or [],
+                "source": getattr(video, "source", ""),
+                "url": getattr(video, "download_url", None) or getattr(video, "url", ""),
+                "preview_url": getattr(video, "preview_url", ""),
+                "duration": getattr(video, "duration", 0),
+                "width": getattr(video, "width", 0),
+                "height": getattr(video, "height", 0),
+            })
+        return library
+
+    def _stock_match_prompt(
+        self,
+        range_item: dict,
+        concept: dict,
+        stock_library: list[dict],
+    ) -> str:
+        compact_library = [
+            {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "tags": item.get("tags", [])[:8],
+                "source": item.get("source"),
+            }
+            for item in stock_library[:30]
+        ]
+        return (
+            "You are a strict stock-footage relevance evaluator for an EDL.\n"
+            "Choose the stock clip whose metadata best matches the narration quote.\n"
+            "The quote may be Vietnamese; reason semantically and generate English stock search terms.\n\n"
+            "Return ONLY valid JSON with this schema:\n"
+            "{\n"
+            '  "best_source": "stock_0 or null",\n'
+            '  "score": 0.0,\n'
+            '  "verdict": "MATCH or MISMATCH",\n'
+            '  "reason": "short reason",\n'
+            '  "search_query": "english 4-6 word stock search query"\n'
+            "}\n\n"
+            "Scoring:\n"
+            "- 0.80-1.00: direct visual match for the quote\n"
+            "- 0.55-0.79: acceptable generic visual match\n"
+            "- below 0.55: mismatch; search again\n\n"
+            f"Video concept: {json.dumps(concept, ensure_ascii=False)[:2000]}\n\n"
+            f"EDL range: {json.dumps(range_item, ensure_ascii=False)}\n\n"
+            f"Stock library: {json.dumps(compact_library, ensure_ascii=False)}"
+        )
+
+    def _fallback_stock_match(self, range_item: dict, stock_library: list[dict]) -> dict:
+        quote = str(range_item.get("quote") or range_item.get("reason") or "").lower()
+        quote_words = {
+            w for w in re.findall(r"[a-zA-Z][a-zA-Z]{2,}", quote)
+            if w not in {"the", "and", "for", "with", "this", "that", "from"}
+        }
+        best_id = None
+        best_score = 0.0
+        for item in stock_library:
+            haystack = " ".join([
+                str(item.get("title") or ""),
+                " ".join(str(t) for t in item.get("tags", [])),
+                str(item.get("source") or ""),
+            ]).lower()
+            overlap = sum(1 for word in quote_words if word in haystack)
+            score = min(0.75, overlap / max(4, len(quote_words))) if quote_words else 0.35
+            if score > best_score:
+                best_id = item.get("id")
+                best_score = score
+        search_query = " ".join(list(quote_words)[:6]) or str(range_item.get("beat") or "documentary b roll")
+        return {
+            "best_source": best_id,
+            "score": best_score,
+            "verdict": "MATCH" if best_score >= 0.55 else "MISMATCH",
+            "reason": "fallback lexical match",
+            "search_query": search_query,
+        }
+
+    async def _evaluate_stock_match(
+        self,
+        range_item: dict,
+        concept: dict,
+        stock_library: list[dict],
+    ) -> dict:
+        api_key = config.settings.openrouter_api_key
+        if not api_key or not stock_library:
+            return self._fallback_stock_match(range_item, stock_library)
+
+        from helpers.llm_task import TASK_MODELS, call_openrouter, extract_json
+
+        prompt = self._stock_match_prompt(range_item, concept, stock_library)
+        model = TASK_MODELS.get("verify_stock_relevance", "google/gemini-2.5-flash-lite")
+        try:
+            raw = await asyncio.to_thread(call_openrouter, model, prompt, api_key)
+            parsed = extract_json(raw)
+            if isinstance(parsed, dict):
+                parsed.setdefault("score", 0.0)
+                parsed.setdefault("verdict", "MISMATCH")
+                return parsed
+        except Exception as e:
+            self.logger.warning(f"[agent] EDL stock-match eval failed; using fallback: {e}")
+        return self._fallback_stock_match(range_item, stock_library)
+
+    async def _evaluate_stock_visual_match(
+        self,
+        range_item: dict,
+        concept: dict,
+        stock_item: dict,
+    ) -> dict:
+        """Use the stock thumbnail as the final judge for quote/source relevance."""
+        preview_url = str(stock_item.get("preview_url") or "").strip()
+        if not preview_url:
+            return {"accepted": True, "reason": "no preview thumbnail available"}
+
+        api_key = config.settings.openrouter_api_key
+        if not api_key:
+            return {"accepted": True, "reason": "OPENROUTER_API_KEY unavailable; fail-open"}
+
+        from helpers.llm_task import TASK_MODELS, call_openrouter_vision
+
+        prompt = (
+            "You are a strict visual editor checking whether a stock video thumbnail fits a narration beat.\n"
+            "The thumbnail is a proxy for the video. Reject generic or unrelated footage.\n\n"
+            f"Video concept: {json.dumps(concept, ensure_ascii=False)[:1600]}\n"
+            f"Narration quote: {range_item.get('quote', '')}\n"
+            f"Beat/reason: {range_item.get('beat', '')} / {range_item.get('reason', '')}\n"
+            f"Candidate stock metadata: {json.dumps(stock_item, ensure_ascii=False)[:1200]}\n\n"
+            "ACCEPT only if the image visibly supports the quote, or is a strong contextual b-roll "
+            "for an abstract transition in the same topic.\n"
+            "REJECT if it shows the wrong geography/culture, unrelated objects, random nature/city shots, "
+            "or a generic visual that does not help this narration beat.\n\n"
+            "Respond with ONLY one word: ACCEPT or REJECT"
+        )
+        model = TASK_MODELS.get("verify_stock_relevance", "google/gemini-2.5-flash-lite")
+        try:
+            raw = await asyncio.to_thread(call_openrouter_vision, model, prompt, preview_url, api_key)
+            accepted = "ACCEPT" in raw.upper() and "REJECT" not in raw.upper()
+            return {"accepted": accepted, "reason": raw.strip()[:200]}
+        except Exception as e:
+            self.logger.warning(f"[agent] visual stock-match eval failed; fail-open: {e}")
+            return {"accepted": True, "reason": f"vision eval failed: {e}"}
+
+    async def _repair_edl_stock_matches(self, edl_path: Path, concept: dict, stock_videos: list) -> Path:
+        """Ensure every EDL quote uses matching stock; search again when current library is weak."""
+        try:
+            edl = json.loads(edl_path.read_text())
+            ranges = edl.get("ranges", [])
+            if not ranges:
+                return edl_path
+
+            sources = edl.setdefault("sources", {})
+            stock_library = self._build_stock_library(stock_videos)
+            source_ids = {item["id"] for item in stock_library}
+            report: list[dict] = []
+            changed = False
+            topic_context = " ".join(
+                str(concept.get(k, "")) for k in ("title", "hook", "thumbnail_concept")
+            ).strip()
+
+            for index, range_item in enumerate(ranges):
+                current_source = range_item.get("source")
+                evaluation = await self._evaluate_stock_match(range_item, concept, stock_library)
+                best_source = evaluation.get("best_source")
+                score = float(evaluation.get("score") or 0.0)
+                verdict = str(evaluation.get("verdict") or "").upper()
+                action = "kept"
+                visual_evaluation: dict = {}
+
+                if best_source in source_ids and (best_source != current_source or score >= 0.55):
+                    if best_source not in sources:
+                        best_item = next((item for item in stock_library if item.get("id") == best_source), None)
+                        if best_item and best_item.get("url"):
+                            sources[best_source] = best_item["url"]
+                            changed = True
+                    if best_source != current_source:
+                        self.logger.info(
+                            f"[agent] EDL range {index}: source {current_source} -> {best_source} "
+                            f"(score={score:.2f})"
+                        )
+                        range_item["source"] = best_source
+                        changed = True
+                        action = "switched_existing"
+                selected_item = next(
+                    (item for item in stock_library if item.get("id") == range_item.get("source")),
+                    None,
+                )
+                if selected_item:
+                    visual_evaluation = await self._evaluate_stock_visual_match(range_item, concept, selected_item)
+                    if not visual_evaluation.get("accepted", True):
+                        verdict = "MISMATCH"
+                        score = min(score, 0.30)
+                        self.logger.info(
+                            f"[agent] EDL range {index}: visual thumbnail rejected "
+                            f"{range_item.get('source')} ({visual_evaluation.get('reason', '')})"
+                        )
+                if score < 0.55 or verdict == "MISMATCH" or range_item.get("source") not in sources:
+                    query = str(evaluation.get("search_query") or "").strip()
+                    if not query:
+                        query = str(range_item.get("quote") or range_item.get("beat") or "documentary b roll")
+                    self.logger.info(f"[agent] EDL range {index}: stock mismatch, searching again: {query}")
+                    range_context = " ".join([
+                        topic_context,
+                        str(range_item.get("quote") or ""),
+                        str(range_item.get("reason") or ""),
+                    ]).strip()
+                    replacements = await self.video_fetcher.search_all_sources(
+                        query,
+                        max_results_per_source=6,
+                        topic_context=range_context or None,
+                    )
+                    replacements = [v for v in replacements if v.width >= v.height]
+                    if replacements:
+                        replacement = replacements[0]
+                        new_id = f"stock_{len(sources)}"
+                        sources[new_id] = replacement.download_url or replacement.url
+                        stock_videos.append(replacement)
+                        new_item = self._build_stock_library([replacement])[0]
+                        new_item["id"] = new_id
+                        stock_library.append(new_item)
+                        source_ids.add(new_id)
+                        range_item["source"] = new_id
+                        changed = True
+                        action = "searched_replacement"
+                        self.logger.info(f"[agent] EDL range {index}: replaced with freshly searched {new_id}")
+                        visual_evaluation = {"accepted": True, "reason": "replacement passed search visual filter"}
+
+                report.append({
+                    "range_index": index,
+                    "quote": range_item.get("quote", ""),
+                    "source": range_item.get("source"),
+                    "score": score,
+                    "verdict": verdict or ("MATCH" if score >= 0.55 else "MISMATCH"),
+                    "reason": evaluation.get("reason", ""),
+                    "search_query": evaluation.get("search_query", ""),
+                    "action": action,
+                    "visual_accepted": visual_evaluation.get("accepted"),
+                    "visual_reason": visual_evaluation.get("reason", ""),
+                })
+
+            if changed:
+                edl["ranges"] = ranges
+                edl["sources"] = sources
+                edl_path.write_text(json.dumps(edl, indent=2, ensure_ascii=False))
+            report_path = edl_path.parent / "edl_match_report.json"
+            report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+            bad = [r for r in report if r["score"] < 0.55]
+            self.logger.info(
+                f"[agent] EDL stock-match validation complete: {len(report) - len(bad)}/{len(report)} matched"
+            )
+        except Exception as e:
+            self.logger.warning(f"[agent] EDL stock-match repair failed (using as-is): {e}")
         return edl_path
 
     def _dedup_edl_sources(self, edl_path: Path, available_sources: dict) -> Path:
@@ -960,6 +1341,13 @@ class VideoAgent:
             props = dict(spec.get("props", {}))
             duration_s = float(spec.get("duration_s", 5.0))
             props["duration_s"] = duration_s
+            if template == "map_highlight":
+                # Remotion's render CLI shallow-merges missing keys from the Composition's
+                # Studio-preview defaultProps (Root.tsx) — explicitly fill optional fields so
+                # an LLM spec that omits them never leaks unrelated example data (e.g. "INDIA").
+                props.setdefault("subline", "")
+                props.setdefault("callouts", [])
+                props.setdefault("marker_label", "")
             out_path = overlays_dir / f"overlay_{i}_{template}.mp4"
             try:
                 await asyncio.to_thread(
@@ -984,6 +1372,77 @@ class VideoAgent:
         results = await asyncio.gather(*(render_one(i, s) for i, s in enumerate(specs)))
         return [r for r in results if r]
 
+    @staticmethod
+    def _dedupe_overlay_specs(specs: list[dict]) -> list[dict]:
+        """Drop duplicate map highlights that would render the same region-only animation."""
+        deduped: list[dict] = []
+        seen_map_regions: set[str] = set()
+        for spec in specs:
+            if spec.get("template") != "map_highlight":
+                deduped.append(spec)
+                continue
+            props = spec.get("props") if isinstance(spec.get("props"), dict) else {}
+            region_key = str(props.get("region") or "").strip().casefold()
+            if region_key and region_key in seen_map_regions:
+                continue
+            if region_key:
+                seen_map_regions.add(region_key)
+            deduped.append(spec)
+        return deduped
+
+    @staticmethod
+    def _prefer_specific_map_regions(specs: list[dict]) -> list[dict]:
+        """Correct broad continent regions when the spec text names a specific country."""
+        country_aliases = {
+            "ai cập": "Ai Cập",
+            "egypt": "Egypt",
+            "cairo": "Ai Cập",
+            "nam phi": "Nam Phi",
+            "south africa": "South Africa",
+            "ma-rốc": "Ma-rốc",
+            "maroc": "Ma-rốc",
+            "morocco": "Morocco",
+            "nigeria": "Nigeria",
+            "kenya": "Kenya",
+            "ethiopia": "Ethiopia",
+            "ethiopie": "Ethiopia",
+            "algeria": "Algeria",
+            "algérie": "Algeria",
+            "tunisia": "Tunisia",
+            "ghana": "Ghana",
+            "sudan": "Sudan",
+            "libya": "Libya",
+        }
+        continent_regions = {"châu phi", "africa", "châu á", "asia", "châu âu", "europe"}
+
+        fixed: list[dict] = []
+        for spec in specs:
+            if spec.get("template") != "map_highlight":
+                fixed.append(spec)
+                continue
+            props = spec.get("props") if isinstance(spec.get("props"), dict) else {}
+            region = str(props.get("region") or "").strip()
+            if region.casefold() not in continent_regions:
+                fixed.append(spec)
+                continue
+
+            haystack_parts = [region, str(props.get("headline") or ""), str(props.get("subline") or "")]
+            callouts = props.get("callouts")
+            if isinstance(callouts, list):
+                haystack_parts.extend(str(item) for item in callouts)
+            haystack = " ".join(haystack_parts).casefold()
+
+            replacement = next((country for alias, country in country_aliases.items() if alias in haystack), None)
+            if replacement:
+                new_spec = dict(spec)
+                new_props = dict(props)
+                new_props["region"] = replacement
+                new_spec["props"] = new_props
+                fixed.append(new_spec)
+            else:
+                fixed.append(spec)
+        return fixed
+
     def _overlays_fresh(self, edl_path: Path, overlays_dir: Path) -> bool:
         manifest_path = overlays_dir / "manifest.json"
         if not edl_path.exists() or not manifest_path.exists():
@@ -991,8 +1450,15 @@ class VideoAgent:
         if manifest_path.stat().st_mtime < edl_path.stat().st_mtime:
             return False
         try:
-            overlays = json.loads(manifest_path.read_text())
+            manifest = json.loads(manifest_path.read_text())
         except json.JSONDecodeError:
+            return False
+        if not isinstance(manifest, dict):
+            return False
+        if manifest.get("version") != self.OVERLAY_CACHE_VERSION:
+            return False
+        overlays = manifest.get("overlays")
+        if not isinstance(overlays, list):
             return False
         return all(Path(o["file"]).exists() for o in overlays)
 
@@ -1011,16 +1477,26 @@ class VideoAgent:
             overlays = []
         else:
             specs = await self._generate_overlay_specs(script, concept, edl_path.parent)
+            # stat_card still renders as a flat full-screen card (looks cheap) — only
+            # map_highlight has the real-map treatment, so drop stat_card specs for now.
+            specs = [s for s in specs if s.get("template") == "map_highlight"]
+            specs = self._prefer_specific_map_regions(specs)
+            specs = self._dedupe_overlay_specs(specs)
             if not specs:
                 self.logger.info("[agent] no overlay graphics needed for this script")
                 overlays = []
             else:
+                for old_overlay in overlays_dir.glob("overlay_*_map_highlight.mp4"):
+                    old_overlay.unlink(missing_ok=True)
                 overlays = await self._render_overlays(specs, total_duration_s, overlays_dir)
                 self.logger.info(f"[agent] added {len(overlays)} map/stat overlay graphics")
 
         edl["overlays"] = overlays
-        edl_path.write_text(json.dumps(edl, indent=2))
-        manifest_path.write_text(json.dumps(overlays, indent=2))
+        edl_path.write_text(json.dumps(edl, indent=2, ensure_ascii=False))
+        manifest_path.write_text(json.dumps({
+            "version": self.OVERLAY_CACHE_VERSION,
+            "overlays": overlays,
+        }, indent=2, ensure_ascii=False))
 
     def _attach_subtitles(self, edl_path: Path, work_dir: Path, srt_path: Path) -> None:
         """Build master.srt from cached word-level transcripts and wire it into the EDL."""
@@ -1036,7 +1512,7 @@ class VideoAgent:
 
     def _build_master_srt(self, edl: dict, work_dir: Path) -> Optional[Path]:
         """Rule 5: output-timeline offsets. Rule 6: snap to word boundaries.
-        Rule 8: word-level verbatim ASR only. Rule 9: reuse cached transcripts.
+        Rule 9: reuse cached transcripts.
 
         Workflow A lays a single continuous voiceover track under the cut
         b-roll (render.py mixes it untouched, only the visual is looped/trimmed
@@ -1051,6 +1527,7 @@ class VideoAgent:
         voiceover_json = transcripts_dir / "voiceover.json"
         if voiceover_json.exists():
             words = self._load_transcript_words(voiceover_json)
+            words = self._apply_script_text_to_word_timings(words, work_dir)
             cues = self._words_to_cues(words)
         else:
             cues = []
@@ -1086,6 +1563,48 @@ class VideoAgent:
     def _load_transcript_words(path: Path) -> list[dict]:
         data = json.loads(path.read_text())
         return [w for w in data.get("words", []) if w.get("type") == "word"]
+
+    def _apply_script_text_to_word_timings(self, words: list[dict], work_dir: Path) -> list[dict]:
+        """Use ASR word timings but preserve the approved script spelling/diacritics.
+
+        ElevenLabs Scribe/Whisper can hear Vietnamese correctly enough for timing
+        while still dropping or changing accents. The script is the source of truth
+        for subtitle text; ASR is only the clock.
+        """
+        script_path = work_dir / "script.txt"
+        if not words or not script_path.exists():
+            return words
+
+        script_tokens = re.findall(r"\S+", script_path.read_text().strip(), flags=re.UNICODE)
+        if not script_tokens:
+            return words
+
+        ratio = len(script_tokens) / max(1, len(words))
+        if ratio < 0.65 or ratio > 1.45:
+            self.logger.warning(
+                "[agent] script/transcript word count differs too much "
+                f"({len(script_tokens)} script vs {len(words)} ASR); using ASR subtitle text"
+            )
+            return words
+
+        aligned: list[dict] = []
+        limit = min(len(words), len(script_tokens))
+        for i in range(limit):
+            item = dict(words[i])
+            item["text"] = script_tokens[i]
+            aligned.append(item)
+
+        if len(script_tokens) > limit and aligned:
+            remainder = " ".join(script_tokens[limit:])
+            aligned[-1]["text"] = f"{aligned[-1]['text']} {remainder}".strip()
+        elif len(words) > limit:
+            aligned.extend(words[limit:])
+
+        self.logger.info(
+            f"[agent] subtitle text normalized from script.txt "
+            f"({len(script_tokens)} script tokens, {len(words)} ASR words)"
+        )
+        return aligned
 
     @staticmethod
     def _words_to_cues(
@@ -1141,9 +1660,21 @@ class VideoAgent:
             "--input", str(script_path),
             "--output", str(metadata_path),
         ], "generate SEO metadata")
-        if metadata_path.exists():
-            return json.loads(metadata_path.read_text())
-        return {}
+        if not metadata_path.exists():
+            return {}
+        metadata = json.loads(metadata_path.read_text())
+
+        # CC-BY (and similar) tracks require attribution — append it to the
+        # description so it ships even on auto-upload. assets/music/CREDIT.txt is a
+        # generic sidecar: drop a new licensed track + its credit text, no code change.
+        credit_path = Path("assets/music/CREDIT.txt")
+        if credit_path.exists():
+            credit = credit_path.read_text().strip()
+            if credit and credit not in metadata.get("description", ""):
+                metadata["description"] = f"{metadata.get('description', '').rstrip()}\n\n{credit}"
+                metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+
+        return metadata
 
     async def _generate_effects(
         self,
@@ -1665,34 +2196,14 @@ EDL ranges:
         if kind in {"comparison_table", "key_card", "timeline_steps", "callout"}:
             return self._create_semantic_overlay(kind, duration, color, output_path, resolution, effect)
 
-        safe_color = color if color.startswith("#") and len(color) == 7 else "#66E3FF"
-        color_expr = f"0x{safe_color[1:]}"
         duration_expr = f"{duration:.3f}"
 
         if kind == "pulse_frame":
-            effect_filter = (
-                f"drawbox=x=0:y=0:w=iw:h=ih:color={color_expr}@0.55:t=22,"
-                f"drawbox=x=54:y=54:w=260:h=18:color={color_expr}@0.95:t=fill,"
-                f"drawbox=x=54:y=54:w=18:h=160:color={color_expr}@0.95:t=fill,"
-                f"drawbox=x=iw-314:y=ih-72:w=260:h=18:color={color_expr}@0.95:t=fill,"
-                f"drawbox=x=iw-72:y=ih-214:w=18:h=160:color={color_expr}@0.95:t=fill"
-            )
+            effect_filter = "colorchannelmixer=aa=0"
         elif kind == "lower_accent":
-            effect_filter = (
-                f"drawbox=x=iw*0.12:y=ih*0.84:"
-                f"w='iw*0.76*min(t/{duration_expr},1)':h=8:"
-                f"color={color_expr}@0.95:t=fill,"
-                f"drawbox=x=iw*0.12:y=ih*0.86:"
-                f"w='iw*0.52*min(t/{duration_expr},1)':h=4:"
-                f"color=white@0.75:t=fill"
-            )
+            effect_filter = "colorchannelmixer=aa=0"
         else:
-            effect_filter = (
-                f"drawbox=x='-260+(t/{duration_expr})*(iw+520)':"
-                f"y=0:w=280:h=ih:color={color_expr}@0.42:t=fill,"
-                f"drawbox=x='-160+(t/{duration_expr})*(iw+360)':"
-                f"y=0:w=70:h=ih:color=white@0.32:t=fill"
-            )
+            effect_filter = "colorchannelmixer=aa=0"
 
         cmd = [
             "ffmpeg", "-y",
@@ -1860,6 +2371,13 @@ EDL ranges:
     # ── Private: Asset fetching ───────────────────────────────────────────────
 
     async def _fetch_stock_videos(self, keywords: list[str], work_dir: Path, max_per_keyword: int = 5, topic_context: Optional[str] = None) -> list:
+        cache_path = work_dir / "stock_videos.json"
+        fingerprint = self._stock_cache_fingerprint(keywords, max_per_keyword, topic_context)
+        cached = self._load_stock_cache(cache_path, fingerprint)
+        if cached is not None:
+            self.logger.info(f"[agent] ✓ stock videos (cached): {len(cached)} clips")
+            return cached
+
         self.logger.info(f"[agent] fetching stock videos: {len(keywords)} keywords")
         videos = []
         seen_ids: set = set()
@@ -1879,8 +2397,57 @@ EDL ranges:
                 videos.extend(unique[:max_per_keyword])
             except Exception as e:
                 self.logger.warning(f"[agent] stock fetch failed for '{kw}': {e}")
-        self.logger.info(f"[agent] fetched {len(videos)} unique landscape stock clips")
+        by_source = {}
+        for video in videos:
+            source = getattr(video, "source", "unknown")
+            by_source[source] = by_source.get(source, 0) + 1
+        self.logger.info(f"[agent] fetched {len(videos)} unique landscape stock clips by source: {by_source}")
+        self._write_stock_cache(cache_path, fingerprint, videos)
         return videos
+
+    def _stock_cache_fingerprint(
+        self,
+        keywords: list[str],
+        max_per_keyword: int,
+        topic_context: Optional[str],
+    ) -> str:
+        payload = {
+            "version": "stock_search_v2",
+            "keywords": keywords,
+            "max_per_keyword": max_per_keyword,
+            "topic_context": topic_context,
+            "stock_video_sources": config.settings.stock_video_sources,
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _load_stock_cache(self, cache_path: Path, fingerprint: str) -> Optional[list[StockVideo]]:
+        if not cache_path.exists() or cache_path.stat().st_size < 10:
+            return None
+        try:
+            data = json.loads(cache_path.read_text())
+            if data.get("fingerprint") != fingerprint:
+                return None
+            videos = data.get("videos")
+            if not isinstance(videos, list):
+                return None
+            return [StockVideo(**item) for item in videos]
+        except Exception as e:
+            self.logger.warning(f"[agent] stock cache invalid, refetching: {e}")
+            return None
+
+    def _write_stock_cache(self, cache_path: Path, fingerprint: str, videos: list) -> None:
+        def dump_video(video):
+            if hasattr(video, "model_dump"):
+                return video.model_dump()
+            if hasattr(video, "dict"):
+                return video.dict()
+            return dict(video)
+
+        cache_path.write_text(json.dumps({
+            "fingerprint": fingerprint,
+            "videos": [dump_video(video) for video in videos],
+        }, indent=2, ensure_ascii=False))
 
     async def _generate_voiceover(self, script: str, work_dir: Path) -> Optional[Path]:
         from src.modules.voice_subtitle import VoiceoverGenerator
@@ -1890,11 +2457,9 @@ EDL ranges:
         preferred_provider = (config.settings.tts_provider or "").strip().lower()
         if preferred_provider:
             providers = [preferred_provider, *[p for p in ("elevenlabs", "edge_tts", "gtts") if p != preferred_provider]]
-        elif language.startswith("vi") and (config.settings.elevenlabs_voice_id or config.settings.voice_id) == "pFZP5JQG7iQjIQuC4Bku":
+        elif language.startswith("vi"):
             providers = ["edge_tts", "elevenlabs", "gtts"]
-            self.logger.warning(
-                "[agent] configured ElevenLabs voice is Lily/British English; using Edge Vietnamese first"
-            )
+            self.logger.info("[agent] Vietnamese voiceover: using Edge TTS first unless TTS_PROVIDER overrides it")
         else:
             providers = ["elevenlabs", "edge_tts", "gtts"]
 
@@ -1907,7 +2472,7 @@ EDL ranges:
                     language=language,
                 )
                 self.logger.info(f"[agent] voiceover via {provider}")
-                self._write_voiceover_fingerprint(out_path, script)
+                self._write_voiceover_fingerprint(out_path, script, provider)
                 return Path(result) if result else None
             except Exception as e:
                 self.logger.warning(f"[agent] voiceover {provider} failed: {e}")
@@ -1923,6 +2488,8 @@ EDL ranges:
             "elevenlabs_voice_id": config.settings.elevenlabs_voice_id,
             "voice_id": config.settings.voice_id,
             "elevenlabs_model_id": config.settings.elevenlabs_model_id,
+            "elevenlabs_language_code": config.settings.elevenlabs_language_code,
+            "voiceover_policy_version": 2,
         }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -1939,15 +2506,18 @@ EDL ranges:
             return False
         return meta.get("fingerprint") == self._voiceover_fingerprint(script)
 
-    def _write_voiceover_fingerprint(self, voiceover_path: Path, script: str) -> None:
+    def _write_voiceover_fingerprint(self, voiceover_path: Path, script: str, provider_used: str) -> None:
         from src.core import config
         meta = {
             "fingerprint": self._voiceover_fingerprint(script),
             "tts_provider": config.settings.tts_provider,
+            "tts_provider_used": provider_used,
             "voice_language": config.settings.voice_language,
             "elevenlabs_voice_id": config.settings.elevenlabs_voice_id,
             "voice_id": config.settings.voice_id,
             "elevenlabs_model_id": config.settings.elevenlabs_model_id,
+            "elevenlabs_language_code": config.settings.elevenlabs_language_code,
+            "voiceover_policy_version": 2,
         }
         voiceover_path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
 
@@ -1959,6 +2529,7 @@ EDL ranges:
             "--output", str(transcript_dir),
             "--language", config.settings.voice_language or "vi",
         ], "transcribe voiceover")
+        self._normalize_voiceover_transcript_text(transcript_dir / f"{audio_path.stem}.json", work_dir)
 
         packed_md = work_dir / "takes_packed.md"
         self._run_helper([
@@ -1967,6 +2538,31 @@ EDL ranges:
         ], "pack transcripts")
         return packed_md
 
+    def _normalize_voiceover_transcript_text(self, transcript_path: Path, work_dir: Path) -> None:
+        if not transcript_path.exists():
+            return
+        try:
+            data = json.loads(transcript_path.read_text())
+            words = data.get("words", [])
+            word_indexes = [
+                i for i, word in enumerate(words)
+                if word.get("type") == "word" and word.get("text", "").strip()
+            ]
+            aligned = self._apply_script_text_to_word_timings(
+                [words[i] for i in word_indexes],
+                work_dir,
+            )
+            if len(aligned) != len(word_indexes):
+                return
+            for source_index, aligned_word in zip(word_indexes, aligned):
+                words[source_index]["text"] = aligned_word.get("text", words[source_index].get("text", ""))
+            data["words"] = words
+            data["_script_text_normalized"] = 2
+            transcript_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+            self.logger.info(f"[agent] normalized transcript text from script: {transcript_path}")
+        except Exception as e:
+            self.logger.warning(f"[agent] could not normalize transcript text from script: {e}")
+
     def _transcript_fresh(self, audio_path: Path, packed_md: Path) -> bool:
         from src.core import config
         transcript_json = packed_md.parent / "transcripts" / f"{audio_path.stem}.json"
@@ -1974,6 +2570,12 @@ EDL ranges:
         if not packed_md.exists() or packed_md.stat().st_size < 10:
             return False
         if not transcript_json.exists() or not transcript_cache.exists():
+            return False
+        try:
+            transcript_data = json.loads(transcript_json.read_text())
+            if transcript_data.get("_script_text_normalized") != 2:
+                return False
+        except json.JSONDecodeError:
             return False
         language = config.settings.voice_language or "vi"
         if f":{language.split('-')[0]}" not in transcript_cache.read_text().strip():
@@ -2056,59 +2658,98 @@ EDL ranges:
         work_dir: Path,
         session: VideoSession,
     ) -> Optional[Path]:
-        """Self-evaluation: check cut boundaries, cap at MAX_SELF_EVAL_PASSES."""
+        """Self-evaluation: vision-model + audio-pop check at every cut boundary
+        (helpers/self_eval.py). Auto-fixes (pad escalation / source swap) and
+        re-renders, up to MAX_SELF_EVAL_PASSES, before flagging for manual review."""
         verify_dir = work_dir / "verify"
+        final_path = work_dir / "final.mp4"
+        import shutil
 
+        if not edl_path:
+            # Storyboard/hybrid workflows don't carry an EDL here — just dump verify
+            # PNGs for manual review and promote preview → final.
+            self._run_helper([
+                "helpers/timeline_view.py", str(preview_path),
+                "--output", str(verify_dir / "pass_1"),
+            ], "timeline view pass 1")
+            shutil.copy2(str(preview_path), str(final_path))
+            return final_path
+
+        current_edl = edl_path
         for pass_num in range(1, self.MAX_SELF_EVAL_PASSES + 1):
             session.self_eval_passes = pass_num
             self.logger.info(f"[agent] self-eval pass {pass_num}/{self.MAX_SELF_EVAL_PASSES}")
 
             verify_dir_pass = verify_dir / f"pass_{pass_num}"
-            timeline_cmd = [
-                "helpers/timeline_view.py", str(preview_path),
+            issues_path = verify_dir_pass / "issues.json"
+            fixed_edl_path = work_dir / f"edl_fixed_pass{pass_num}.json"
+
+            self._run_helper([
+                "helpers/self_eval.py", str(preview_path),
+                "--edl", str(current_edl),
                 "--output", str(verify_dir_pass),
-            ]
-            if edl_path:
-                timeline_cmd += ["--cuts", str(edl_path)]
-            self._run_helper(timeline_cmd, f"timeline view pass {pass_num}")
+                "--report", str(issues_path),
+                "--fix-output", str(fixed_edl_path),
+            ], f"self-eval pass {pass_num}")
 
-            # Claude Code reviews the PNGs and decides whether to continue
-            # In programmatic mode: if no issues detected, promote preview → final
-            final_path = work_dir / "final.mp4"
-            import shutil
-            shutil.copy2(str(preview_path), str(final_path))
+            issues = json.loads(issues_path.read_text()) if issues_path.exists() else []
 
-            self.logger.info(
-                f"[agent] self-eval pass {pass_num} done. "
-                f"Verify PNGs: {verify_dir_pass}"
-            )
+            if not issues:
+                self.logger.info(f"[agent] self-eval pass {pass_num}: clean, promoting to final")
+                shutil.copy2(str(preview_path), str(final_path))
+                return final_path
+
+            self.logger.warning(f"[agent] self-eval pass {pass_num}: {len(issues)} issue(s) found")
             session.session_notes.append(
-                f"Self-eval pass {pass_num}: verify PNGs at {verify_dir_pass}"
+                f"Self-eval pass {pass_num}: {len(issues)} issue(s), auto-fixed and re-rendered"
             )
 
-            # In interactive mode, Claude Code reviews PNGs and iterates
-            # In automated mode, we stop after first pass (no visual judge)
-            return final_path
+            if pass_num == self.MAX_SELF_EVAL_PASSES or not fixed_edl_path.exists():
+                break
+
+            current_edl = fixed_edl_path
+            self._render(current_edl, preview_path)
 
         self.logger.warning(
-            f"[agent] self-eval: {self.MAX_SELF_EVAL_PASSES} passes done, "
+            f"[agent] self-eval: {self.MAX_SELF_EVAL_PASSES} passes done, issues remain — "
             "flagging to user for manual review"
         )
-        return preview_path
+        shutil.copy2(str(preview_path), str(final_path))
+        return final_path
 
     # ── Private: Upload ───────────────────────────────────────────────────────
 
-    async def _upload(self, video_path: Path, metadata: dict):
+    async def _upload(
+        self,
+        video_path: Path,
+        metadata: dict,
+        concept: Optional[dict] = None,
+        topic: str = "",
+    ):
         title = metadata.get("title", f"Video {datetime.now().strftime('%Y-%m-%d')}")
         description = metadata.get("description", "")
         tags = metadata.get("tags", [])
+        thumbnail_path = None
+        try:
+            from helpers.thumbnail import generate_thumbnail
+
+            thumbnail_path = generate_thumbnail(
+                metadata=metadata,
+                concept=concept or {},
+                work_dir=video_path.parent,
+                topic=topic,
+            )
+            self.logger.info(f"[agent] thumbnail: {thumbnail_path}")
+        except Exception as e:
+            self.logger.warning(f"[agent] thumbnail generation failed: {e}")
         try:
             video_id = self.uploader.upload_video(
                 str(video_path),
                 title=title,
                 description=description,
                 tags=tags[:15],
-                is_public=True,
+                is_public=False,
+                thumbnail_path=str(thumbnail_path) if thumbnail_path else None,
             )
             self.logger.info(f"[agent] uploaded: youtube.com/watch?v={video_id}")
         except Exception as e:

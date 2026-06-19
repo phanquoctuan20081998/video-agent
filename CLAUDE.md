@@ -23,8 +23,8 @@ Input: video files in a directory → Output: `outputs/edit/final.mp4`
 | # | Rule |
 |---|------|
 | 1 | Subtitles applied LAST in filter chain, after all overlays |
-| 2 | Per-segment extract → lossless `-c copy` concat (no double-encode) |
-| 3 | 30ms audio fades at every segment boundary (prevents pops) |
+| 2 | Per-segment extract → CFR re-encode (`-r 30`) at extract time, lossless `-c copy` concat after. (Was pure `-c copy` extract; changed because VFR/sparse-keyframe stock sources made `-ss`/`-t` durations on a stream-copy unreliable — observed ~2x-length segments.) |
+| 3 | 30ms audio fades at every segment boundary (prevents pops) — applies to Workflow B's native camera audio. Workflow A (stock + generated voiceover) drops b-roll's native audio entirely and attaches the single continuous voiceover file after concat, instead of mixing per-segment audio through; stock sources have inconsistent sample rates/channel layouts, and carrying that through 18+ stream-copy splices was producing corrupted/cut-out audio mid-playback. |
 | 4 | Overlays use `setpts=PTS-STARTPTS+T/TB` for frame-0 alignment |
 | 5 | Master SRT uses output-timeline offsets (not source offsets) |
 | 6 | Never cut inside a word; snap to transcript boundaries |

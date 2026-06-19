@@ -3,8 +3,8 @@
 Audio mixing: background music + per-scene sound effects.
 
 Background music:
-  - Searches Pixabay Music API for mood-matched track
-  - Falls back to any file in assets/music/
+  - assets/music/bg_music.mp3 (user drop-in) takes priority
+  - Else searches Jamendo API for a mood-matched Creative Commons track (JAMENDO_CLIENT_ID)
   - Loops to video duration, mixed at -22dB under voiceover
 
 Sound effects:
@@ -86,7 +86,7 @@ def fetch_music(mood: str = "cinematic", duration_s: float = 60.0) -> Path | Non
     Find/download background music:
     1. assets/music/bg_music.mp3 (user drop-in)
     2. Any *.mp3 in assets/music/
-    3. Pixabay Music API (uses PIXABAY_API_KEY)
+    3. Jamendo API (Creative Commons tracks, uses JAMENDO_CLIENT_ID)
     """
     MUSIC_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -102,40 +102,47 @@ def fetch_music(mood: str = "cinematic", duration_s: float = 60.0) -> Path | Non
         print(f"[audio_mixer] using cached music: {existing[0].name}", file=sys.stderr)
         return existing[0]
 
-    # Pixabay Music API
-    api_key = os.getenv("PIXABAY_API_KEY", "")
-    if api_key:
+    # Jamendo API (Creative Commons music, free for non-commercial use)
+    client_id = os.getenv("JAMENDO_CLIENT_ID", "")
+    if client_id:
         try:
             import httpx
-            query = {
-                "cinematic": "cinematic background",
-                "upbeat": "upbeat motivational",
-                "minimal": "minimal ambient",
-                "dramatic": "epic dramatic",
+            tags = {
+                "cinematic": "cinematic",
+                "upbeat": "happy",
+                "minimal": "ambient",
+                "dramatic": "epic",
             }.get(mood, mood)
 
+            dur_min = max(20, int(duration_s * 0.5))
+            dur_max = max(dur_min + 60, int(duration_s * 3))
+
             r = httpx.get(
-                "https://pixabay.com/api/videos/music/",
+                "https://api.jamendo.com/v3.0/tracks/",
                 params={
-                    "key": api_key,
-                    "q": query,
-                    "duration_min": max(30, int(duration_s * 0.5)),
-                    "per_page": 5,
+                    "client_id": client_id,
+                    "format": "json",
+                    "limit": 5,
+                    "fuzzytags": tags,
+                    "durationbetween": f"{dur_min}_{dur_max}",
+                    "audioformat": "mp32",
+                    "order": "popularity_total",
                 },
                 timeout=15,
             )
             r.raise_for_status()
-            hits = r.json().get("hits", [])
-            if hits:
-                music_url = hits[0].get("audio", {}).get("url", "")
-                if music_url:
-                    import urllib.request
-                    dest = MUSIC_DIR / f"pixabay_{hits[0].get('id', 'track')}.mp3"
-                    req = urllib.request.Request(music_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
-                        f.write(resp.read())
-                    print(f"[audio_mixer] downloaded music: {dest.name}", file=sys.stderr)
-                    return dest
+            results = r.json().get("results", [])
+            for track in results:
+                music_url = track.get("audiodownload") if track.get("audiodownload_allowed") else track.get("audio")
+                if not music_url:
+                    continue
+                import urllib.request
+                dest = MUSIC_DIR / f"jamendo_{track.get('id', 'track')}.mp3"
+                req = urllib.request.Request(music_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+                    f.write(resp.read())
+                print(f"[audio_mixer] downloaded music: {dest.name} ({track.get('name')} by {track.get('artist_name')})", file=sys.stderr)
+                return dest
         except Exception as e:
             print(f"[audio_mixer] music fetch failed: {e}", file=sys.stderr)
 

@@ -70,6 +70,7 @@ class YouTubeUploader:
         """Upload video to YouTube"""
         try:
             youtube = self._get_youtube_service()
+            from googleapiclient.http import MediaFileUpload
             
             body = {
                 "snippet": {
@@ -90,7 +91,7 @@ class YouTubeUploader:
             request = youtube.videos().insert(
                 part="snippet,status",
                 body=body,
-                media_body=video_path,
+                media_body=MediaFileUpload(video_path, chunksize=-1, resumable=True),
                 notifySubscribers=False
             )
             
@@ -116,9 +117,11 @@ class YouTubeUploader:
     ):
         """Upload thumbnail for video"""
         try:
+            from googleapiclient.http import MediaFileUpload
+
             youtube_service.thumbnails().set(
                 videoId=video_id,
-                media_body=thumbnail_path
+                media_body=MediaFileUpload(thumbnail_path)
             ).execute()
             
             self.logger.info(f"Thumbnail uploaded for video {video_id}")
@@ -137,6 +140,7 @@ class YouTubeUploader:
         """Schedule video for later publishing"""
         try:
             youtube = self._get_youtube_service()
+            from googleapiclient.http import MediaFileUpload
             
             body = {
                 "snippet": {
@@ -157,7 +161,7 @@ class YouTubeUploader:
             request = youtube.videos().insert(
                 part="snippet,status",
                 body=body,
-                media_body=video_path,
+                media_body=MediaFileUpload(video_path, chunksize=-1, resumable=True),
                 notifySubscribers=False
             )
             

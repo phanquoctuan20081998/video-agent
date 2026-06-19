@@ -14,6 +14,7 @@ Usage:
     final = self_eval_loop(video_path, storyboard, voiceover_path, output_path)
 """
 
+import base64
 import json
 import os
 import sys
@@ -21,8 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from helpers.timeline_view import view_cut_boundary, extract_frame, extract_waveform
-from helpers.llm_task import call_openrouter_vision, TASK_MODELS
+from helpers.timeline_view import view_cut_boundary, extract_frame, extract_waveform, compute_cut_times_from_edl
+from helpers.llm_task import call_openrouter_vision, extract_json, TASK_MODELS
 
 MAX_PASSES = 3
 EVAL_MODEL = TASK_MODELS.get("verify_stock_relevance", "google/gemini-2.5-flash-lite")
@@ -298,19 +299,123 @@ def self_eval_loop(
     return video_path
 
 
+def evaluate_cut_point_edl(
+    video: str,
+    cut_time: float,
+    window: float,
+    work_dir: Path,
+    label: str,
+    range_index: int | None,
+    api_key: str,
+) -> dict:
+    """Evaluate one EDL cut boundary: audio-pop heuristic + vision-model filmstrip check."""
+    results = view_cut_boundary(video, cut_time, window, work_dir, label)
+    filmstrip_path = results.get("filmstrip")
+    issues: list[str] = []
+
+    if _check_waveform_spike(video, cut_time):
+        issues.append("AUDIO_POP: waveform spike detected at cut boundary")
+
+    if api_key and filmstrip_path and Path(filmstrip_path).exists():
+        try:
+            b64 = base64.b64encode(Path(filmstrip_path).read_bytes()).decode()
+            raw = call_openrouter_vision(EVAL_MODEL, EVAL_PROMPT, f"data:image/png;base64,{b64}", api_key)
+            verdict = extract_json(raw)
+            if isinstance(verdict, dict) and not verdict.get("pass", True):
+                issues.extend(verdict.get("issues", []))
+        except Exception as e:
+            print(f"[self_eval] vision check failed for {label}: {e}", file=sys.stderr)
+
+    return {
+        "pass": not issues,
+        "label": label,
+        "time": cut_time,
+        "range_index": range_index,
+        "issues": issues,
+    }
+
+
+def self_eval_pass_edl(video_path: Path, edl: dict, work_dir: Path) -> list[dict]:
+    """Run one self-evaluation pass over an EDL-rendered video. Returns list of issue dicts."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    cut_times = compute_cut_times_from_edl(edl)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    issues = []
+    print(f"[self_eval] checking {len(cut_times)} boundary points", file=sys.stderr)
+    for ts, label, range_index in cut_times:
+        result = evaluate_cut_point_edl(str(video_path), ts, 3.0, work_dir, label, range_index, api_key)
+        if not result["pass"]:
+            issues.append(result)
+            print(f"[self_eval] ISSUE at {ts:.2f}s ({label}): {result['issues']}", file=sys.stderr)
+
+    if not issues:
+        print("[self_eval] ✓ all checks passed", file=sys.stderr)
+    return issues
+
+
+def fix_edl_from_issues(edl: dict, issues: list[dict]) -> dict:
+    """Apply automatic fixes to an EDL based on detected issues, mutating ranges.
+
+    Fixes:
+    - REPEAT_CONTENT → swap the affected range's source to a different available one.
+    - AUDIO_POP / VISUAL_JUMP / BLACK_FRAME / POOR_GRADE → escalate pad_ms on the range(s)
+      adjacent to that boundary so the cut snaps further from the problem transition.
+    """
+    ranges = edl.get("ranges", [])
+    source_names = list(edl.get("sources", {}).keys())
+
+    for issue in issues:
+        idx = issue.get("range_index")
+        if idx is None or not (0 <= idx < len(ranges)):
+            continue
+        for issue_str in issue.get("issues", []):
+            if "REPEAT_CONTENT" in issue_str:
+                current = ranges[idx]["source"]
+                alt = next((s for s in source_names if s != current), current)
+                ranges[idx]["source"] = alt
+                print(f"[self_eval:fix] range {idx}: swapped source {current} -> {alt}", file=sys.stderr)
+            else:
+                for neighbor in (idx - 1, idx):
+                    if 0 <= neighbor < len(ranges):
+                        ranges[neighbor]["pad_ms"] = min(200, ranges[neighbor].get("pad_ms", 30) + 60)
+                print(f"[self_eval:fix] range {idx} (+neighbor): increased pad_ms", file=sys.stderr)
+
+    edl["ranges"] = ranges
+    return edl
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Self-evaluate rendered video")
     parser.add_argument("video", help="Rendered video path")
-    parser.add_argument("--storyboard", required=True, help="Storyboard JSON path")
+    parser.add_argument("--storyboard", help="Storyboard JSON path")
+    parser.add_argument("--edl", help="EDL JSON path")
     parser.add_argument("--output", default=None, help="Output directory for verify PNGs")
+    parser.add_argument("--report", default=None, help="Write issues JSON here (--edl mode)")
+    parser.add_argument("--fix-output", default=None, help="If issues found, write auto-fixed EDL here")
     args = parser.parse_args()
 
     video_path = Path(args.video)
-    storyboard = json.loads(Path(args.storyboard).read_text())
     work_dir = Path(args.output) if args.output else video_path.parent
 
+    if args.edl:
+        edl = json.loads(Path(args.edl).read_text())
+        issues = self_eval_pass_edl(video_path, edl, work_dir)
+        if args.report:
+            Path(args.report).write_text(json.dumps(issues, indent=2, ensure_ascii=False))
+        if issues and args.fix_output:
+            fixed = fix_edl_from_issues(edl, issues)
+            Path(args.fix_output).write_text(json.dumps(fixed, indent=2, ensure_ascii=False))
+        # Issues are normal, recoverable data for the caller to act on — not a script failure.
+        return
+
+    if not args.storyboard:
+        print("ERROR: --storyboard or --edl required", file=sys.stderr)
+        sys.exit(2)
+
+    storyboard = json.loads(Path(args.storyboard).read_text())
     issues = self_eval_pass(video_path, storyboard, work_dir)
     if issues:
         print(f"\nFound {len(issues)} issues:", file=sys.stderr)

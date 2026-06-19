@@ -8,6 +8,7 @@ from src.modules.video_editor import VideoEditor
 from src.modules.voice_subtitle import VoiceoverGenerator, SubtitleGenerator
 from src.modules.youtube_uploader import YouTubeUploader
 from src.modules.agent import VideoAgent, VideoSession
+from src.modules.geography_autopilot import GeographyAutopilot
 
 __all__ = [
     "ContentSearcher",
@@ -20,4 +21,5 @@ __all__ = [
     "YouTubeUploader",
     "VideoAgent",
     "VideoSession",
+    "GeographyAutopilot",
 ]

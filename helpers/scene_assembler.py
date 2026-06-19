@@ -254,16 +254,9 @@ def render_pil_scene(scene: dict, output: Path) -> Path:
             font_path = candidate
             break
 
-    def ease_out_cubic(t):
-        return 1 - (1 - t) ** 3
-
     for frame_idx in range(total_frames):
-        t = frame_idx / max(total_frames - 1, 1)
         img = Image.new("RGB", (width, height), bg_color)
         draw = ImageDraw.Draw(img)
-
-        # Animate text reveal (ease out)
-        reveal_progress = ease_out_cubic(min(t * 3, 1.0))  # reveal in first 1/3
 
         # Main text
         font_size = props.get("font_size", 72)
@@ -274,10 +267,6 @@ def render_pil_scene(scene: dict, output: Path) -> Path:
             font = ImageFont.load_default()
             sub_font = font
 
-        # Calculate visible characters based on reveal
-        visible_chars = int(len(text) * reveal_progress)
-        visible_text = text[:visible_chars]
-
         # Center text (based on full text width for stable anchoring)
         bbox = draw.textbbox((0, 0), text, font=font)
         full_w = bbox[2] - bbox[0]
@@ -285,23 +274,12 @@ def render_pil_scene(scene: dict, output: Path) -> Path:
         text_y = height // 2 - 50
 
         # Draw with accent on first word
-        draw.text((text_x, text_y), visible_text, fill=text_color, font=font)
+        draw.text((text_x, text_y), text, fill=text_color, font=font)
 
-        # Subtext (fades in after main)
-        if subtext and t > 0.4:
-            sub_progress = ease_out_cubic(min((t - 0.4) * 3, 1.0))
-            sub_visible = subtext[:int(len(subtext) * sub_progress)]
+        if subtext:
             sub_bbox = draw.textbbox((0, 0), subtext, font=sub_font)
             sub_x = (width - (sub_bbox[2] - sub_bbox[0])) // 2
-            draw.text((sub_x, text_y + 100), sub_visible, fill=accent_color, font=sub_font)
-
-        # Accent bar (bottom)
-        bar_width = int(width * 0.3 * reveal_progress)
-        bar_y = height - 60
-        draw.rectangle(
-            [(width // 2 - bar_width // 2, bar_y), (width // 2 + bar_width // 2, bar_y + 4)],
-            fill=accent_color,
-        )
+            draw.text((sub_x, text_y + 100), subtext, fill=accent_color, font=sub_font)
 
         img.save(frames_dir / f"frame_{frame_idx:05d}.png")
 
@@ -393,31 +371,15 @@ def _generate_hf_html(props: dict, duration_s: float) -> str:
   }}
   .main-text {{
     font-size: 72px; font-weight: 900; color: white;
-    opacity: 0; transform: translateY(40px);
-    animation: revealUp 0.8s ease-out 0.2s forwards;
   }}
   .sub-text {{
     font-size: 36px; color: {accent_color}; margin-top: 24px;
-    opacity: 0; transform: translateY(20px);
-    animation: revealUp 0.6s ease-out 0.8s forwards;
-  }}
-  .accent-bar {{
-    width: 0; height: 4px; background: {accent_color};
-    margin-top: 40px;
-    animation: expandBar 1s ease-out 0.4s forwards;
-  }}
-  @keyframes revealUp {{
-    to {{ opacity: 1; transform: translateY(0); }}
-  }}
-  @keyframes expandBar {{
-    to {{ width: 300px; }}
   }}
 </style>
 </head>
 <body>
   <div class="main-text">{text}</div>
   <div class="sub-text">{subtext}</div>
-  <div class="accent-bar"></div>
 </body>
 </html>"""
 

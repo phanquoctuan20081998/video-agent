@@ -23,6 +23,8 @@ load_dotenv()
 
 TASK_MODELS = {
     "generate_script": "meta-llama/llama-3.3-70b-instruct",
+    "audit_script": "google/gemini-2.5-flash-lite",
+    "generate_geo_topics": "google/gemini-2.5-flash-lite",
     "generate_edl": "deepseek/deepseek-r1",
     "generate_storyboard": "deepseek/deepseek-r1",
     "generate_hybrid_storyboard": "deepseek/deepseek-r1",
@@ -64,16 +66,76 @@ Rules:
 - Each paragraph = one breath / scene cut
 - Hook in first 5 seconds
 - No filler intros like "Hey guys welcome back"
-- End with clear CTA
 - Match the concept language. If Vietnamese, write natural Vietnamese narration.
 - Vietnamese output must use only Vietnamese Quốc ngữ text; do not include Chinese characters.
 - For geography/listicle concepts, use short punchy facts, vivid comparisons, and map-friendly visual cues.
+- Write like a narrator telling a curious little story, not like a school essay or news report.
+- Keep the mood bright, playful, and approachable. Make it witty and lightly funny without turning into stand-up comedy.
+- Use charming everyday comparisons, small surprises, and conversational pivots like "nghe hơi lạ đúng không", "nhưng khoan", "và đây mới vui".
+- Avoid fearmongering, over-dramatic doom language, corporate wording, and stiff textbook phrasing.
+- If writing Vietnamese, make it sound like a warm, mischievous Vietnamese storyteller: natural, lively, and easy to speak out loud.
+- End with only a soft, short CTA asking viewers to like and subscribe. Do not over-sell it.
+- Good Vietnamese ending style: "Nếu thấy câu chuyện này thú vị, nhớ like và đăng ký kênh nhé."
 
 Concept:
 {input}
 
 Return ONLY the script text the narrator will speak. No JSON. No metadata. No labels.
 No "Estimated duration", no "Scene count", no section headers. Just the spoken words.""",
+
+    "audit_script": """You are a senior YouTube narration editor and script doctor.
+Review and correct this generated voiceover script for a {duration}s video.
+
+Your job:
+- Preserve the original meaning, structure, language, and approximate length.
+- Correct awkward phrasing, grammar, repetition, stiff wording, and unnatural spoken rhythm.
+- Make it sound like a warm narrator telling a curious little story.
+- Keep the mood bright, playful, witty, and lightly funny without becoming silly or noisy.
+- Strengthen the first 5 seconds as a clean hook if needed.
+- Keep paragraphs short: each paragraph should feel like one breath / scene cut.
+- For Vietnamese, use natural Quốc ngữ only. No Chinese characters. Avoid textbook phrasing.
+- For geography/fact scripts, keep claims cautious and do not invent new statistics or facts.
+- Remove over-dramatic fearmongering, corporate wording, and generic YouTube filler.
+- Ensure the ending has only a short soft CTA to like and subscribe.
+- Good Vietnamese ending style: "Nếu thấy câu chuyện này thú vị, nhớ like và đăng ký kênh nhé."
+
+Concept/context:
+{context_section}
+
+Draft script:
+{input}
+
+Return ONLY the corrected script the narrator will speak. No JSON. No labels. No review notes.""",
+
+    "generate_geo_topics": """You are a YouTube geography channel strategist.
+Pick video topics for a Vietnamese-language geography explainer channel.
+
+Goal:
+- Find ideas that can become bright, curious, story-driven geography videos.
+- Prefer "why/how" topics with a clear map/geography reason.
+- Avoid generic trivia, war gore, hateful framing, political propaganda, or doom-only angles.
+- Avoid repeating topics already used.
+- Each topic must be specific enough for a 60-90 second video.
+- Titles/topic ideas should be in Vietnamese.
+
+Trend and competitor context:
+{input}
+
+Previously used topics:
+{context_section}
+
+Return ONLY valid JSON:
+[
+  {{
+    "topic": "Vì sao ...?",
+    "angle": "one sentence explaining the story angle",
+    "keywords": ["english stock search phrase", "english stock search phrase"],
+    "score": 0.0,
+    "reason": "why this has viral potential"
+  }}
+]
+
+Return 8-12 candidates sorted by score descending.""",
 
     "generate_edl": """You are a professional video editor AI.
 Given a packed transcript of video takes, generate an EDL (Edit Decision List) as JSON.
@@ -84,10 +146,18 @@ Rules:
 - Prefer silence gaps ≥400ms for cuts
 - Label each range with a beat (HOOK, PROBLEM, SOLUTION, BENEFIT, EXAMPLE, CTA)
 - Include quote (verbatim words) and reason for each cut
+- Cap every range at ~8 seconds, even if the underlying narration runs longer uninterrupted —
+  split a longer stretch into multiple consecutive ranges (alternating sources) so the footage
+  cuts every few seconds. A single range covering 20+ seconds of narration is wrong: viewers
+  expect new footage every 3-8s in this fast-paced explainer style. Most ranges should land in
+  the 3-6s sweet spot.
 - Spread ranges evenly across ALL available sources before reusing any of them.
 - Assign sources in round-robin order (stock_0 for range 1, stock_1 for range 2, etc.)
 - If there are more ranges than sources, looping back is fine — but never let two consecutive
   ranges share the same source (viewers notice back-to-back repeats, not spaced-out repeats).
+- If Additional context includes stock_library metadata, choose the source whose title/tags/query
+  best match the range quote and reason. Never assign a source just because it is next in order
+  when another source is visibly more relevant to the quote.
 
 Packed transcript:
 {input}
@@ -284,6 +354,17 @@ Rules:
 - position_fraction estimates how far through the script's runtime this moment occurs (0.0 = start, 1.0 = end).
 - duration_s between 4 and 6.
 - Don't invent statistics or facts not present in the script.
+- For map_highlight, choose the MOST SPECIFIC mappable place named in that script moment:
+  country > city/landmark/river/desert/region > continent. Do NOT use a continent when
+  the sentence names a country or place inside that continent. Examples:
+  "Ai Cập" → region "Ai Cập" or "Egypt", NOT "Châu Phi";
+  "Cairo" → region "Ai Cập" or "Egypt", NOT "Châu Phi";
+  "Sahara" → region "Sahara" only if supported, otherwise the nearest named country/region,
+  NOT generic "Châu Phi" unless the narration is explicitly about the whole continent.
+- Use continent regions like "Châu Phi" only when the narration is truly about the entire
+  continent as a whole, not when it is discussing a specific country/place within it.
+- Do not create multiple map_highlight overlays for the same country/region/place. A repeated
+  map of the same region looks identical; use at most one map_highlight per unique region.
 - Skip this entirely (return []) if the script has no clear place names or stats to highlight.
 
 Concept context:
@@ -469,7 +550,7 @@ def main():
 
     print(f"[llm_task] task={args.task} model={model}", file=sys.stderr)
 
-    json_tasks = {"generate_concept", "generate_edl", "generate_storyboard", "generate_hybrid_storyboard", "generate_overlays", "analyze_content", "generate_seo", "generate_search_terms"}
+    json_tasks = {"generate_concept", "generate_geo_topics", "generate_edl", "generate_storyboard", "generate_hybrid_storyboard", "generate_overlays", "analyze_content", "generate_seo", "generate_search_terms"}
     result = ""
     max_retries = 3
     for attempt in range(1, max_retries + 1):

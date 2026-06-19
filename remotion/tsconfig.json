@@ -6,6 +6,7 @@
     "jsx": "react",
     "strict": true,
     "moduleResolution": "bundler",
+    "resolveJsonModule": true,
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "skipLibCheck": true

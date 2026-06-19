@@ -35,9 +35,10 @@ class AppSettings(BaseSettings):
     pexels_api_key: str = Field(default="", alias="PEXELS_API_KEY")
     pixabay_api_key: str = Field(default="", alias="PIXABAY_API_KEY")
     coverr_api_key: str = Field(default="", alias="COVERR_API_KEY")
+    vimeo_access_token: str = Field(default="", alias="VIMEO_ACCESS_TOKEN")
     unsplash_api_key: str = Field(default="", alias="UNSPLASH_API_KEY")
-    stock_video_sources: str = Field(default="pexels,pixabay,youtube_cc", alias="STOCK_VIDEO_SOURCES")
-    enable_coverr: bool = Field(default=False, alias="ENABLE_COVERR")
+    stock_video_sources: str = Field(default="pexels,pixabay,youtube_cc,coverr", alias="STOCK_VIDEO_SOURCES")
+    enable_coverr: bool = Field(default=True, alias="ENABLE_COVERR")
     
     # Voice & Audio
     elevenlabs_api_key: str = Field(default="", alias="ELEVENLABS_API_KEY")
@@ -70,6 +71,17 @@ class AppSettings(BaseSettings):
     video_output_format: str = Field(default="mp4", alias="VIDEO_OUTPUT_FORMAT")
     max_video_length: int = Field(default=3600, alias="MAX_VIDEO_LENGTH")
 
+    # Autopilot / review workflow
+    autopilot_duration_s: int = Field(default=75, alias="AUTOPILOT_DURATION_S")
+    autopilot_mode: str = Field(default="edl", alias="AUTOPILOT_MODE")
+    autopilot_review_email_to: str = Field(default="", alias="AUTOPILOT_REVIEW_EMAIL_TO")
+    autopilot_review_email_from: str = Field(default="", alias="AUTOPILOT_REVIEW_EMAIL_FROM")
+    smtp_host: str = Field(default="", alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_username: str = Field(default="", alias="SMTP_USERNAME")
+    smtp_password: str = Field(default="", alias="SMTP_PASSWORD")
+    smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
+
     @field_validator("debug", mode="before")
     @classmethod
     def parse_debug(cls, value):
@@ -80,6 +92,13 @@ class AppSettings(BaseSettings):
     @field_validator("enable_coverr", mode="before")
     @classmethod
     def parse_enable_coverr(cls, value):
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return value
+
+    @field_validator("smtp_use_tls", mode="before")
+    @classmethod
+    def parse_smtp_use_tls(cls, value):
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return value

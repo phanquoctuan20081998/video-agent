@@ -69,18 +69,6 @@ def has_audio_stream(path: Path) -> bool:
     return any(s.get("codec_type") == "audio" for s in streams)
 
 
-def find_music_asset() -> Path | None:
-    music_dir = Path("assets/music")
-    if not music_dir.exists():
-        return None
-    for pattern in ("bg_music.mp3", "*.mp3", "*.m4a", "*.wav", "*.aac"):
-        matches = sorted(music_dir.glob(pattern))
-        for match in matches:
-            if match.exists() and match.stat().st_size > 10000:
-                return match
-    return None
-
-
 def generate_music_bed(duration: float, output_path: Path) -> Path:
     """Generate a fallback music bed when no licensed music file exists."""
     duration = max(1.0, duration)
@@ -112,7 +100,8 @@ def mix_background_music(video_path: Path, output_path: Path) -> Path:
     if duration <= 0 or not has_audio_stream(video_path):
         return video_path
 
-    music_path = find_music_asset()
+    from helpers.audio_mixer import fetch_music
+    music_path = fetch_music(duration_s=duration)
     work_dir = output_path.parent
     if not music_path:
         music_path = generate_music_bed(duration, work_dir / "fallback_music.m4a")
@@ -158,12 +147,9 @@ def match_video_duration(video_path: Path, target_duration: float, out_path: Pat
         "-i", str(video_path),
         "-t", f"{target_duration:.3f}",
         "-map", "0:v:0",
-        "-map", "0:a?",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
         str(out_path),
     ], "match video duration to voiceover")
     return out_path
@@ -176,15 +162,20 @@ def extract_segment(
     out_path: Path,
     pad_ms: int = 30,
 ) -> Path:
-    """Lossless segment extract with padding (Rule 2, 7).
-    Clamps timestamps to source duration to handle wrong EDL offsets."""
+    """Segment extract with padding (Rule 7). Clamps timestamps to source duration to
+    handle wrong EDL offsets.
+    Re-encodes (not -c copy): some downloaded stock sources are VFR or have sparse
+    keyframes, which makes -ss/-t duration on a stream-copy unreliable (observed: -t
+    silently producing ~2x the requested length). Re-encoding with explicit CFR makes
+    seek/duration exact at the cost of one extra encode pass per segment."""
     src_dur = get_duration(source_path)
     if src_dur > 0:
         # Clamp: if start beyond source, use proportional position
         if start >= src_dur:
+            span = end - start  # preserve requested duration before reassigning start
             ratio = start / max(end, start + 1)
             start = src_dur * ratio * 0.5
-            end = min(src_dur, start + (end - start))
+            end = min(src_dur, start + span)
             print(f"[render] clamped timestamps to [{start:.2f}-{end:.2f}] (src={src_dur:.1f}s)", file=sys.stderr)
         end = min(end, src_dur)
 
@@ -196,7 +187,9 @@ def extract_segment(
         "-ss", str(padded_start),
         "-i", source_path,
         "-t", str(duration),
-        "-c", "copy",
+        "-r", "30",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
         "-avoid_negative_ts", "make_zero",
         str(out_path),
     ], f"extract {Path(source_path).name} [{start:.2f}-{end:.2f}]")
@@ -254,31 +247,37 @@ def add_overlay(
     start_in_output: float,
     duration: float,
     out_path: Path,
+    mode: str = "replace",
 ) -> Path:
-    """Screen-blend overlay (Rule 4). Black pixels in overlay = transparent.
-    Works for motion graphic effects (light sweeps, frames, glows).
-    PTS-shifted so overlay starts at start_in_output seconds (Rule 4)."""
+    """Composite an overlay clip onto the base (Rule 4), PTS-shifted so it starts at
+    start_in_output seconds.
+    mode="replace": full-frame cutaway — the overlay (e.g. MapHighlight) is opaque and
+      same dimensions as the base, fully replacing the frame for its duration, like a
+      standalone inserted scene.
+    mode="screen": screen-blend — black pixels in the overlay are transparent, bright
+      pixels are additive. For semantically-transparent motion graphics (light sweeps,
+      frame accents) that should sit on top of the footage, not replace it."""
     overlay_path = Path(overlay_file)
     if not overlay_path.is_absolute():
         overlay_path = Path.cwd() / overlay_file
 
     end_t = start_in_output + duration
+    if mode == "screen":
+        filter_complex = (
+            f"[1:v]setpts=PTS-STARTPTS+{start_in_output}/TB,format=rgb24[ov];"
+            f"[0:v][ov]blend=screen:enable='between(t,{start_in_output},{end_t})'[vout]"
+        )
+    else:
+        filter_complex = (
+            f"[1:v]setpts=PTS-STARTPTS+{start_in_output}/TB,format=yuv420p[ov];"
+            f"[0:v][ov]overlay=enable='between(t,{start_in_output},{end_t})'[vout]"
+        )
+
     run([
         "ffmpeg", "-y",
         "-i", str(base_path),
         "-i", str(overlay_path),
-        "-filter_complex",
-        (
-            # Shift overlay PTS to start_in_output (Rule 4)
-            f"[1:v]setpts=PTS-STARTPTS+{start_in_output}/TB,format=rgb24[ov];"
-            # Screen blend: black=transparent, bright=additive.
-            # NOTE: named "all_mode=screen:all_opacity=..." corrupts colors
-            # (verified: produces a pink/magenta tint even at opacity=1.0 —
-            # an ffmpeg blend-filter bug in this param path). The bare
-            # "screen" shorthand is the verified-clean equivalent.
-            f"[0:v][ov]blend=screen:"
-            f"enable='between(t,{start_in_output},{end_t})'[vout]"
-        ),
+        "-filter_complex", filter_complex,
         "-map", "[vout]", "-map", "0:a?",
         "-c:a", "copy",
         str(out_path),
@@ -296,6 +295,10 @@ def burn_subtitles(video_path: Path, srt_path: str, out_path: Path) -> Path:
         "ffmpeg", "-y", "-i", str(video_path),
         "-vf", f"subtitles={srt_escaped}",
         "-c:a", "copy",
+        # moov atom at the front (not the tail) — without this, players that start
+        # reading before the full file/index is available can stutter or drop audio
+        # partway through (observed: audio cuts ~10s in, briefly resumes on seek).
+        "-movflags", "+faststart",
         str(out_path),
     ], "burn subtitles (last step, Rule 1)")
     return out_path
@@ -396,7 +399,7 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
         faded_clip = clips_dir / f"clip_{i:03d}.mp4"
 
         try:
-            extract_segment(source_file, r["start"], r["end"], raw_clip)
+            extract_segment(source_file, r["start"], r["end"], raw_clip, pad_ms=r.get("pad_ms", 30))
         except RuntimeError as e:
             print(f"[render] extract failed for range {i} ({source_name}): {e}", file=sys.stderr)
             continue
@@ -447,12 +450,17 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
     # Step 4: Overlays (Rule 4 — PTS shifted)
     for j, overlay in enumerate(overlays):
         overlay_out = work_dir / f"overlay_{j}.mp4"
+        # style_version 3 = local semantic effects (cut_flash/lower_accent): transparent
+        # motion graphics meant to screen-blend on top. Everything else (map_highlight)
+        # is an opaque full-frame cutaway.
+        mode = "screen" if overlay.get("style_version") == 3 else "replace"
         current = add_overlay(
             current,
             overlay["file"],
             overlay["start_in_output"],
             overlay["duration"],
             overlay_out,
+            mode=mode,
         )
 
     # Step 5: Mix voiceover audio (if present in EDL or auto-detected)
@@ -468,22 +476,21 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
         current = match_video_duration(current, voiceover_duration, matched)
 
         voiced = work_dir / "with_voiceover.mp4"
-        has_audio = has_audio_stream(current)
-        if has_audio:
-            filter_complex = "[0:a]volume=0.1[bg];[1:a]volume=1.0[vo];[bg][vo]amix=inputs=2:duration=shortest[a]"
-            audio_map = "[a]"
-        else:
-            filter_complex = "[1:a]volume=1.0[a]"
-            audio_map = "[a]"
+        # Attach the voiceover as the sole audio track instead of mixing in whatever
+        # native audio survived concat. The b-roll segments come from many different
+        # stock sources with inconsistent sample rates/channel layouts; carrying that
+        # audio through 18 stream-copy splices + a stream_loop re-encode is what was
+        # producing corrupted/cut-out audio mid-playback. Voiceover is one clean
+        # continuous file — just attach it directly.
         run([
             "ffmpeg", "-y",
             "-i", str(current),
             "-i", str(voiceover),
-            "-filter_complex", filter_complex,
-            "-map", "0:v", "-map", audio_map,
+            "-map", "0:v", "-map", "1:a",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
             str(voiced),
-        ], "mix voiceover")
+        ], "attach voiceover")
         current = voiced
 
     # Step 5b: Background music under voiceover
@@ -501,9 +508,14 @@ def render_edl(edl: dict, output_path: Path, resolution: str = "1920x1080") -> P
         burn_subtitles(current, subtitles, subbed)
         current = subbed
 
-    # Copy to final output
-    import shutil
-    shutil.copy2(str(current), str(output_path))
+    # Final output: remux with moov-at-front regardless of which branch above ran
+    # (burn_subtitles already does this, but this guarantees it when there are no
+    # subtitles too — stream copy only, no re-encode).
+    run([
+        "ffmpeg", "-y", "-i", str(current),
+        "-c", "copy", "-movflags", "+faststart",
+        str(output_path),
+    ], "finalize output (faststart)")
     print(f"[render] done: {output_path}", file=sys.stderr)
     return output_path
 
