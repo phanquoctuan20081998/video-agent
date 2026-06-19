@@ -34,6 +34,16 @@ class AppSettings(BaseSettings):
     reddit_client_id: str = Field(default="", alias="REDDIT_CLIENT_ID")
     reddit_client_secret: str = Field(default="", alias="REDDIT_CLIENT_SECRET")
     youtube_developer_key: str = Field(default="", alias="YOUTUBE_DEVELOPER_KEY")
+
+    # X (Twitter) API — bearer token from developer portal
+    x_bearer_token: str = Field(default="", alias="X_BEARER_TOKEN")
+
+    # Facebook/Meta — page access token (for public page trending)
+    facebook_access_token: str = Field(default="", alias="FACEBOOK_ACCESS_TOKEN")
+
+    # Google Custom Search (for fact research — 100 free queries/day)
+    google_search_api_key: str = Field(default="", alias="GOOGLE_SEARCH_API_KEY")
+    google_search_cx: str = Field(default="", alias="GOOGLE_SEARCH_CX")
     
     # Stock Video APIs
     pexels_api_key: str = Field(default="", alias="PEXELS_API_KEY")

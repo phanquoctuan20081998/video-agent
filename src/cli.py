@@ -145,8 +145,9 @@ def generate(topic, keywords, duration, upload, effects, effects_mode, mode, sto
 
 
 @cli.command()
-def trending():
-    """Show trending topics"""
+@click.option("--region", "-r", default="VN", help="Region code (US, VN, etc.)")
+def trending(region):
+    """Show trending topics from YouTube, Google Trends, TikTok"""
     try:
         config.create_dirs()
         
@@ -160,20 +161,210 @@ def trending():
             from src.modules import ContentSearcher
             
             searcher = ContentSearcher()
-            content = await searcher.search_youtube_trending(max_results=10)
-            
-            if content:
-                click.echo("\nTrending Topics on YouTube:\n")
-                for i, item in enumerate(content, 1):
-                    click.echo(f"{i}. {item.title}")
-                    click.echo(f"   Views: {item.views:,}")
-                    click.echo(f"   Keywords: {', '.join(item.keywords[:3])}")
-                    click.echo()
-            else:
+
+            import asyncio as _aio
+            yt_task = searcher.search_youtube_trending(region=region, max_results=10)
+            gt_task = searcher.fetch_google_trends(geo=region, max_results=15)
+            tt_task = searcher.fetch_tiktok_trending(region=region, max_results=10)
+            yt_res, gt_res, tt_res = await _aio.gather(
+                yt_task, gt_task, tt_task, return_exceptions=True
+            )
+
+            yt_content = yt_res if not isinstance(yt_res, Exception) else []
+            gt_terms = gt_res if not isinstance(gt_res, Exception) else []
+            tt_content = tt_res if not isinstance(tt_res, Exception) else []
+
+            if yt_content:
+                click.secho(f"\n{'='*60}", fg="cyan")
+                click.secho(f" YouTube Trending ({region})", fg="cyan", bold=True)
+                click.secho(f"{'='*60}", fg="cyan")
+                for i, item in enumerate(yt_content, 1):
+                    click.echo(f"\n  {i}. {item.title}")
+                    click.echo(f"     Views: {item.views:,}  |  Likes: {item.likes:,}  |  "
+                               f"Velocity: {item.velocity:,.0f} v/hr  |  "
+                               f"Engagement: {item.engagement_rate:.2%}")
+                    if item.keywords:
+                        click.echo(f"     Tags: {', '.join(item.keywords[:5])}")
+
+            if gt_terms:
+                click.secho(f"\n{'='*60}", fg="green")
+                click.secho(f" Google Trends — Hot Searches ({region})", fg="green", bold=True)
+                click.secho(f"{'='*60}", fg="green")
+                for i, term in enumerate(gt_terms, 1):
+                    click.echo(f"  {i:>2}. {term}")
+
+            if tt_content:
+                click.secho(f"\n{'='*60}", fg="magenta")
+                click.secho(f" TikTok Trending Hashtags ({region})", fg="magenta", bold=True)
+                click.secho(f"{'='*60}", fg="magenta")
+                for i, item in enumerate(tt_content, 1):
+                    click.echo(f"  {i:>2}. {item.title}  —  {item.description}")
+
+            if not yt_content and not gt_terms and not tt_content:
                 click.secho("No trending content found", fg="yellow")
-        
+
         asyncio.run(_get_trending())
     
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        click.secho(f"Error: {e}", fg="red")
+        exit(1)
+
+
+@cli.command()
+@click.option("--topic", "-t", required=True, help="Topic or niche to research")
+@click.option("--region", "-r", default="VN", help="Region code (US, VN, etc.)")
+@click.option("--output", "-o", default=None, help="Save JSON report to file")
+@click.option("--subreddits", "-s", multiple=True, default=["videos", "Damnthatsinteresting"],
+              help="Subreddits to scan")
+def research(topic, region, output, subreddits):
+    """Deep viral market research — cross-platform trend analysis + AI-generated video ideas"""
+    try:
+        config.create_dirs()
+        logger.remove()
+        logger.add(lambda msg: click.echo(msg, err=True), level="INFO")
+
+        async def _research():
+            import json as _json
+            from src.modules import ContentSearcher
+
+            searcher = ContentSearcher()
+
+            click.secho(f"\n Researching '{topic}' across all platforms...\n", fg="cyan", bold=True)
+
+            report = await searcher.research_viral_topics(
+                topic=topic, region=region, subreddits=list(subreddits)
+            )
+
+            # Show raw signal counts
+            click.secho(f"{'='*60}", fg="cyan")
+            click.secho(f" NICHE RESEARCH: '{topic}'", fg="cyan", bold=True)
+            click.echo(f"  Competitor videos: {len(report.get('competitor_videos', []))} videos")
+            click.echo(f"  Rising in niche:   {len(report.get('rising_in_niche', []))} videos")
+            gtr = report.get('google_related_searches', {})
+            click.echo(f"  Google related:    {len(gtr.get('related_queries', []))} queries, "
+                       f"{len(gtr.get('related_topics', []))} topics")
+            click.echo(f"  Web research:      {len(report.get('web_research', []))} results")
+            click.echo(f"  Reddit niche:      {len(report.get('reddit_niche_posts', []))} posts")
+            click.echo(f"  Subreddits:        {', '.join(report.get('subreddits_used', []))}")
+            click.secho(f"{'='*60}\n", fg="cyan")
+
+            # Show competitor videos
+            competitors = report.get("competitor_videos", [])
+            if competitors:
+                click.secho(f" Top competitor videos for '{topic}':", fg="yellow", bold=True)
+                for i, v in enumerate(competitors[:8], 1):
+                    click.echo(f"  {i}. {v['title']}")
+                    click.echo(f"     {v['views']:,} views | engagement {v['engagement']:.2%}")
+                click.echo()
+
+            # Show Google Trends related queries for the topic
+            related_queries = gtr.get("related_queries", [])
+            if related_queries:
+                click.secho(" Google Trends — what people search about this topic:", fg="green", bold=True)
+                for rq in related_queries[:10]:
+                    click.echo(f"  • {rq['query']}  ({rq.get('growth', '')})")
+                click.echo()
+
+            # Show web search highlights
+            web_results = report.get("web_research", [])
+            if web_results:
+                click.secho(" Web research — existing content in this niche:", fg="yellow", bold=True)
+                for i, wr in enumerate(web_results[:8], 1):
+                    click.echo(f"  {i}. {wr['title']}")
+                    click.echo(f"     {wr.get('snippet', '')[:120]}")
+                    click.echo(f"     {wr.get('source', '')}")
+                click.echo()
+
+            # Show top rising videos (highest velocity)
+            rising = report.get("rising_in_niche", [])
+            if rising:
+                click.secho(f" Rising in '{topic}' niche (last 72h):", fg="yellow", bold=True)
+                for i, v in enumerate(rising[:5], 1):
+                    click.echo(f"  {i}. {v['title']}")
+                    click.echo(f"     {v['views']:,} views | {v['velocity']:,.0f} v/hr | "
+                               f"engagement {v['engagement']:.2%}")
+                click.echo()
+
+            # Feed to LLM for niche video idea generation
+            click.secho(f" Generating video ideas for '{topic}' niche via AI...\n", fg="green", bold=True)
+            import subprocess, sys
+            report_json = _json.dumps(report, ensure_ascii=False, default=str)
+            project_root = Path(__file__).resolve().parent.parent
+            out_path = Path(output) if output else project_root / "outputs" / "edit" / "market_research.json"
+            out_path = out_path.resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Write research data as context, topic as input
+            tmp_context = out_path.parent / "_research_context_tmp.json"
+            tmp_context.write_text(report_json, encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, "helpers/llm_task.py",
+                 "--task", "research_market",
+                 "--input", topic,
+                 "--context", str(tmp_context),
+                 "--output", str(out_path)],
+                capture_output=True, text=True, cwd=str(project_root)
+            )
+            tmp_context.unlink(missing_ok=True)
+
+            if result.returncode == 0 and out_path.exists():
+                ideas = _json.loads(out_path.read_text(encoding="utf-8"))
+                viral_ideas = ideas.get("viral_video_ideas", [])
+
+                # Show niche analysis first
+                niche = ideas.get("niche_analysis", {})
+                if niche:
+                    click.secho(f"{'='*60}", fg="magenta")
+                    click.secho(f" NICHE ANALYSIS: '{topic}'", fg="magenta", bold=True)
+                    click.secho(f"{'='*60}", fg="magenta")
+                    if niche.get("underserved_subtopics"):
+                        click.echo("\n  Underserved subtopics (opportunity!):")
+                        for s in niche["underserved_subtopics"]:
+                            click.echo(f"    → {s}")
+                    if niche.get("content_gaps"):
+                        click.echo("\n  Content gaps (what competitors miss):")
+                        for g in niche["content_gaps"]:
+                            click.echo(f"    → {g}")
+                    if niche.get("audience_questions"):
+                        click.echo("\n  Questions your audience is asking:")
+                        for q in niche["audience_questions"]:
+                            click.echo(f"    ? {q}")
+                    click.echo()
+
+                if viral_ideas:
+                    click.secho(f"{'='*60}", fg="green")
+                    click.secho(f" TOP VIDEO IDEAS FOR '{topic.upper()}'", fg="green", bold=True)
+                    click.secho(f"{'='*60}", fg="green")
+                    for idea in viral_ideas[:10]:
+                        score = idea.get("virality_score", 0)
+                        bar = "█" * int(score / 5) + "░" * (20 - int(score / 5))
+                        click.echo(f"\n  #{idea.get('rank', '?')}  [{bar}] {score}/100")
+                        click.secho(f"  {idea.get('title', '')}", fg="white", bold=True)
+                        if idea.get("title_vi"):
+                            click.echo(f"  VI: {idea['title_vi']}")
+                        click.echo(f"  Hook: {idea.get('hook', '')}")
+                        click.echo(f"  Angle: {idea.get('angle', '')}")
+                        click.echo(f"  Why viral: {idea.get('why_viral', '')}")
+                        if idea.get("evidence"):
+                            click.echo(f"  Evidence: {idea['evidence']}")
+                        click.echo(f"  Gap: {idea.get('content_gap', '')}")
+                        click.echo(f"  Search: {idea.get('estimated_search_volume', '')} | "
+                                   f"Competition: {idea.get('competition_level', '')}")
+                        click.echo(f"  Keywords: {', '.join(idea.get('keywords', []))}")
+                    click.echo()
+                    click.secho(f"  Full report saved → {out_path}", fg="cyan")
+                else:
+                    click.secho("AI returned no ideas — check LLM output", fg="yellow")
+            else:
+                click.secho(f"LLM task failed: {result.stderr[:500]}", fg="red")
+                # Still save raw trend data
+                out_path.write_text(report_json, encoding="utf-8")
+                click.secho(f"Raw trend data saved → {out_path}", fg="yellow")
+
+        asyncio.run(_research())
+
     except Exception as e:
         logger.error(f"Error: {e}")
         click.secho(f"Error: {e}", fg="red")

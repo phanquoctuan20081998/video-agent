@@ -34,17 +34,24 @@ TASK_MODELS = {
     "generate_overlays": "google/gemini-2.5-flash-lite",
     "verify_stock_relevance": "google/gemini-2.5-flash-lite",
     "generate_search_terms": "google/gemini-2.5-flash-lite",
+    "research_market": "meta-llama/llama-3.3-70b-instruct",
+    "deep_research": "meta-llama/llama-3.3-70b-instruct",
+    "fact_check": "google/gemini-2.5-flash-lite",
 }
 
 TASK_PROMPTS = {
-    "generate_concept": """You are a YouTube content strategist.
+    "generate_concept": """You are a YouTube content strategist and research director.
 Given a topic, generate a video concept as JSON with keys:
 - title: catchy YouTube title (max 70 chars)
-- hook: opening 5 seconds description
+- hook: opening 5 seconds description — must reference a surprising SPECIFIC fact or statistic
 - structure: list of sections with labels and descriptions
 - target_duration_s: suggested duration in seconds
 - keywords: list of 10 SEO keywords
 - thumbnail_concept: one-sentence thumbnail description
+- research_questions: list of 5-8 specific questions that need real data/facts to answer
+  (e.g. "What is the exact population density of Mongolia?", "Who first coined the term...?",
+   "What year did X happen?"). These will be researched via web search before writing the script.
+- key_claims: list of 3-5 core factual claims the video should make, each needing verification
 
 Topic: {input}
 
@@ -56,32 +63,55 @@ geographic facts), use fast-paced structure, surprising statistics, map-friendly
 for map/country-highlight overlays, and thumbnail ideas with satellite maps, highlighted country
 shapes, bold text.
 
+The research_questions should be SPECIFIC enough that a Google search can find concrete answers
+with numbers, dates, names, and sources. Bad: "What is interesting about X?"
+Good: "What is X's GDP per capita compared to its neighbors?"
+
 Respond ONLY with valid JSON.""",
 
-    "generate_script": """You are a professional YouTube scriptwriter.
-Given a video concept, write a voiceover script optimized for {duration}s.
+    "generate_script": """You are a professional YouTube scriptwriter who writes FACT-DENSE,
+research-backed narration that makes viewers feel smarter after watching.
 
-Rules:
+Given a video concept AND a research brief with verified facts, write a voiceover script
+optimized for {duration}s.
+
+CRITICAL — FACTUAL DEPTH RULES:
+- Every claim MUST come from the research brief. Do NOT invent statistics or facts.
+- Include SPECIFIC numbers, dates, names, and sources naturally in narration:
+  BAD: "Mongolia is very empty"
+  GOOD: "Mongolia has just 2.2 people per square kilometer — making it the least
+         densely populated country on Earth, according to World Bank data."
+- Attribute key facts conversationally: "researchers at [institution] found...",
+  "according to a [year] [source] report...", "[person], who [role], once said..."
+- Each section should have at least one surprising, specific, verified fact.
+- Comparisons make facts sticky: "That's fewer people than a single Tokyo subway car
+  spread across an area the size of Western Europe."
+- If the research brief lacks data for a claim, phrase it cautiously ("estimated",
+  "roughly", "some experts suggest") — never state uncertain things as absolute fact.
+
+STYLE RULES:
 - Natural spoken language (not written text)
 - Each paragraph = one breath / scene cut
-- Hook in first 5 seconds
+- Hook in first 5 seconds — MUST open with the most surprising fact from the research
 - No filler intros like "Hey guys welcome back"
 - Match the concept language. If Vietnamese, write natural Vietnamese narration.
 - Vietnamese output must use only Vietnamese Quốc ngữ text; do not include Chinese characters.
-- For geography/listicle concepts, use short punchy facts, vivid comparisons, and map-friendly visual cues.
 - Write like a narrator telling a curious little story, not like a school essay or news report.
-- Keep the mood bright, playful, and approachable. Make it witty and lightly funny without turning into stand-up comedy.
-- Use charming everyday comparisons, small surprises, and conversational pivots like "nghe hơi lạ đúng không", "nhưng khoan", "và đây mới vui".
-- Avoid fearmongering, over-dramatic doom language, corporate wording, and stiff textbook phrasing.
-- If writing Vietnamese, make it sound like a warm, mischievous Vietnamese storyteller: natural, lively, and easy to speak out loud.
-- End with only a soft, short CTA asking viewers to like and subscribe. Do not over-sell it.
-- Good Vietnamese ending style: "Nếu thấy câu chuyện này thú vị, nhớ like và đăng ký kênh nhé."
+- Keep the mood bright, playful, and approachable. Make it witty and lightly funny.
+- Use charming everyday comparisons, small surprises, and conversational pivots.
+- Avoid fearmongering, over-dramatic doom language, corporate wording, stiff textbook phrasing.
+- End with only a soft, short CTA asking viewers to like and subscribe.
+
+THE VIEWER SHOULD FEEL: "Wow I didn't know that" at least 3-4 times in a {duration}s video.
 
 Concept:
 {input}
 
+Research brief with verified facts and sources:
+{context_section}
+
 Return ONLY the script text the narrator will speak. No JSON. No metadata. No labels.
-No "Estimated duration", no "Scene count", no section headers. Just the spoken words.""",
+No section headers. Just the spoken words.""",
 
     "audit_script": """You are a senior YouTube narration editor and script doctor.
 Review and correct this generated voiceover script for a {duration}s video.
@@ -185,6 +215,179 @@ Output JSON matching this schema:
 }}
 
 Respond ONLY with valid JSON.""",
+
+    "research_market": """You are a niche YouTube content researcher specializing in the topic: "{input}".
+
+You will receive NICHE-SPECIFIC research data:
+- **Competitor videos**: what already exists on YouTube for this exact topic, with view counts
+- **Rising videos**: recently uploaded videos in this niche gaining traction
+- **Google related searches**: what people search for WITHIN this topic
+- **Web research**: articles, forums, listicles about this topic
+- **Reddit niche posts**: discussions in relevant subreddits
+
+Your job is NOT to suggest random trending topics. Your ONLY job is to find the BEST video
+ideas WITHIN this specific niche. Every single idea must be directly about {input}.
+
+Analysis approach:
+1. **Competitor gap analysis** — what do the top-performing competitor videos cover? What do they MISS?
+2. **Search demand** — what related queries show people want content that doesn't exist yet?
+3. **Engagement signals** — which competitor videos have unusually high engagement rates?
+4. **Content depth gaps** — where do existing videos stay surface-level but the topic deserves deep exploration?
+5. **Angle originality** — what fresh angle hasn't been tried for this topic?
+
+STRICT RULES:
+- Every idea MUST be about {input}. Zero off-topic ideas.
+- Each idea must be specific enough for a single 60-90 second video.
+- Base ideas on actual gaps found in the research data, not generic suggestions.
+- Reference specific competitor videos or search queries that prove demand.
+
+Niche research data:
+{context_section}
+
+Return ONLY valid JSON:
+{{
+  "niche_analysis": {{
+    "top_performing_content": ["what competitor video titles/angles get the most views"],
+    "underserved_subtopics": ["specific subtopics with search demand but few quality videos"],
+    "audience_questions": ["specific questions people ask about this topic"],
+    "content_gaps": ["what existing videos consistently miss or do poorly"]
+  }},
+  "viral_video_ideas": [
+    {{
+      "rank": 1,
+      "title": "Catchy YouTube title under 70 chars — MUST be about {input}",
+      "title_vi": "Vietnamese version of title",
+      "hook": "First 5 seconds — the surprising fact or question that grabs viewers",
+      "angle": "What makes this DIFFERENT from existing competitor videos",
+      "why_viral": "Specific reason: curiosity gap, surprising comparison, emotional trigger",
+      "evidence": "Which competitor video/search query/reddit post proves demand for this",
+      "target_audience": "Who watches this",
+      "estimated_search_volume": "high/medium/low",
+      "competition_level": "high/medium/low — based on competitor analysis above",
+      "content_gap": "What existing videos on this specific subtopic are missing",
+      "keywords": ["kw1", "kw2", "kw3", "kw4", "kw5"],
+      "thumbnail_concept": "One-sentence thumbnail description",
+      "virality_score": 0.0
+    }}
+  ]
+}}
+
+Return 10-15 ideas sorted by virality_score descending.
+Score 0-100: content gap size (35%), search demand evidence (25%),
+angle originality (20%), emotional hook strength (20%).
+
+REMEMBER: Every single idea must be specifically about {input}. If you suggest an idea about
+music, gaming, sports, or anything unrelated to {input}, your output is WRONG.""",
+
+    "deep_research": """You are a meticulous research analyst preparing a fact brief for a video scriptwriter.
+
+You will receive RAW SEARCH RESULTS from Google/DuckDuckGo/Wikipedia about a video topic.
+Your job: extract, organize, and verify every usable FACT from these sources into a structured
+research brief that a scriptwriter can turn into compelling narration.
+
+EXTRACTION RULES:
+- Pull out SPECIFIC facts: numbers, dates, percentages, names, quotes, rankings
+- For each fact, note the SOURCE (website name + URL) so the scriptwriter can attribute it
+- Flag any facts that appear contradicted across sources
+- Note which facts are most SURPRISING (these become hooks)
+- Note which facts create good COMPARISONS (these make content sticky)
+- Categorize facts by section of the video they'd fit
+
+DO NOT:
+- Invent or extrapolate facts not in the search results
+- Round numbers differently than the source stated
+- Remove attribution — every fact needs its source
+
+Topic: {input}
+
+Raw search results:
+{context_section}
+
+Return ONLY valid JSON:
+{{
+  "topic": "...",
+  "key_findings": [
+    {{
+      "fact": "Mongolia has a population density of 2.2 people per km²",
+      "source": "World Bank via worldbank.org",
+      "source_url": "https://...",
+      "surprise_level": "high",
+      "category": "demographics",
+      "good_for": "hook/opening",
+      "comparison_idea": "That's fewer people than fit in one Tokyo subway car, spread across an area bigger than Western Europe"
+    }}
+  ],
+  "notable_quotes": [
+    {{
+      "quote": "exact quote from source",
+      "speaker": "Name, Title/Role",
+      "source_url": "https://...",
+      "year": "2023"
+    }}
+  ],
+  "statistics": [
+    {{
+      "stat": "2.2 people/km²",
+      "context": "least densely populated sovereign nation",
+      "source": "World Bank",
+      "year": "2023"
+    }}
+  ],
+  "historical_facts": [
+    {{
+      "event": "...",
+      "date": "...",
+      "significance": "...",
+      "source": "..."
+    }}
+  ],
+  "contradictions": [
+    {{
+      "claim": "...",
+      "source_a": "... says X",
+      "source_b": "... says Y",
+      "recommendation": "use X because..."
+    }}
+  ],
+  "best_hooks": [
+    "The single most surprising fact that should open the video",
+    "Second best hook option",
+    "Third option"
+  ],
+  "missing_data": [
+    "Questions from the concept that the search results did NOT answer"
+  ]
+}}""",
+
+    "fact_check": """You are a fact-checker reviewing a video script before production.
+Compare every factual claim in the script against the research brief.
+
+For each claim in the script, verify:
+1. Is it supported by the research brief?
+2. Is the number/date/name accurate?
+3. Is the attribution correct?
+4. Is it stated with appropriate certainty (not overstated)?
+
+Script to check:
+{input}
+
+Research brief:
+{context_section}
+
+Return ONLY valid JSON:
+{{
+  "verdict": "pass" or "needs_fixes",
+  "claims_checked": [
+    {{
+      "claim": "text from script",
+      "status": "verified" or "unverified" or "inaccurate" or "overstated",
+      "research_says": "what the research brief actually says",
+      "fix": "suggested correction if needed"
+    }}
+  ],
+  "unsupported_claims": ["claims in script with no research backing"],
+  "suggested_additions": ["strong facts from research not used in script"]
+}}""",
 
     "analyze_content": """Analyze this video topic and return JSON with:
 - target_audience: description
@@ -491,7 +694,7 @@ def call_openrouter_vision(model: str, prompt: str, image_url: str, api_key: str
 def load_input(path_or_str: str) -> str:
     p = Path(path_or_str)
     if p.exists():
-        return p.read_text()
+        return p.read_text(encoding="utf-8")
     return path_or_str
 
 
@@ -550,7 +753,7 @@ def main():
 
     print(f"[llm_task] task={args.task} model={model}", file=sys.stderr)
 
-    json_tasks = {"generate_concept", "generate_geo_topics", "generate_edl", "generate_storyboard", "generate_hybrid_storyboard", "generate_overlays", "analyze_content", "generate_seo", "generate_search_terms"}
+    json_tasks = {"generate_concept", "generate_geo_topics", "generate_edl", "generate_storyboard", "generate_hybrid_storyboard", "generate_overlays", "analyze_content", "generate_seo", "generate_search_terms", "deep_research", "fact_check", "research_market"}
     result = ""
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -570,7 +773,7 @@ def main():
 
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(result)
+        Path(args.output).write_text(result, encoding="utf-8")
         print(f"[llm_task] written to {args.output}", file=sys.stderr)
     else:
         print(result)

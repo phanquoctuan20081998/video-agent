@@ -159,12 +159,26 @@ class VideoAgent:
         if confirm_strategy:
             self._print_strategy(concept, duration)
 
+        # ── Step 1b: Deep Research (web search → fact brief) ──────────────────
+        research_path = work_dir / "research_brief.json"
+        research_fingerprint = self._artifact_fingerprint({
+            "step": "research",
+            "concept": concept,
+        })
+        if done(research_path) and self._artifact_cache_fresh(research_path, research_fingerprint):
+            self.logger.info("[agent] ✓ research brief (cached)")
+        else:
+            await self._run_deep_research(concept, work_dir, session)
+            if research_path.exists():
+                self._write_artifact_cache(research_path, research_fingerprint)
+
         # ── Step 2: Script ────────────────────────────────────────────────────
         script_path = work_dir / "script.txt"
         script_fingerprint = self._artifact_fingerprint({
             "step": "script",
             "concept": concept,
             "duration": duration,
+            "has_research": research_path.exists(),
         })
         if done(script_path) and self._artifact_cache_fresh(script_path, script_fingerprint):
             self.logger.info("[agent] ✓ script (cached)")
@@ -793,16 +807,108 @@ class VideoAgent:
         session.concept = concept
         return concept
 
+    async def _run_deep_research(
+        self, concept: dict, work_dir: Path, session: VideoSession
+    ) -> Optional[dict]:
+        """Step 1b: Web search → deep_research LLM → structured fact brief."""
+        research_raw_path = work_dir / "_research_raw.json"
+        research_path = work_dir / "research_brief.json"
+
+        # Build search queries from concept
+        topic = concept.get("title", session.topic)
+        research_questions = concept.get("research_questions", [])
+        keywords = concept.get("keywords", [])
+
+        # Combine: topic + concept research questions + keyword-derived queries
+        queries = [topic]
+        for q in research_questions:
+            queries.append(q)
+        # Add keyword combos for breadth
+        if keywords:
+            queries.append(f"{topic} {keywords[0]} statistics data")
+            if len(keywords) > 2:
+                queries.append(f"{topic} {keywords[2]} facts")
+
+        queries_str = ",".join(queries[:12])  # cap at 12 queries
+
+        # Step 1: Web search
+        self.logger.info(f"[agent] running web research: {len(queries)} queries")
+        try:
+            self._run_helper([
+                "helpers/web_research.py",
+                "--topic", topic,
+                "--queries", queries_str,
+                "--output", str(research_raw_path),
+            ], "web research")
+        except RuntimeError as e:
+            self.logger.warning(f"[agent] web research failed: {e}")
+            return None
+
+        if not research_raw_path.exists():
+            self.logger.warning("[agent] web research produced no output")
+            return None
+
+        # Step 2: LLM distills raw search results → structured fact brief
+        self.logger.info("[agent] distilling research into fact brief")
+        try:
+            self._run_helper([
+                "helpers/llm_task.py",
+                "--task", "deep_research",
+                "--input", session.topic,
+                "--context", str(research_raw_path),
+                "--output", str(research_path),
+            ], "deep research distillation")
+        except RuntimeError as e:
+            self.logger.warning(f"[agent] research distillation failed: {e}")
+            return None
+
+        if not research_path.exists():
+            return None
+
+        try:
+            brief = json.loads(research_path.read_text())
+            n_facts = len(brief.get("key_findings", []))
+            n_stats = len(brief.get("statistics", []))
+            n_quotes = len(brief.get("notable_quotes", []))
+            self.logger.info(
+                f"[agent] ✓ research brief: {n_facts} findings, {n_stats} stats, {n_quotes} quotes"
+            )
+            session.session_notes.append(
+                f"Research: {n_facts} findings, {n_stats} stats, {n_quotes} quotes"
+            )
+            return brief
+        except json.JSONDecodeError:
+            self.logger.warning("[agent] research_brief.json invalid JSON")
+            return None
+
     async def _generate_script(
         self, concept: dict, duration: float, session: VideoSession
     ) -> Optional[str]:
         concept_path = Path(session.work_dir) / "concept.json"
         script_path = Path(session.work_dir) / "script.txt"
         draft_path = Path(session.work_dir) / "script.draft.txt"
+        research_path = Path(session.work_dir) / "research_brief.json"
+
+        # Build context: concept + research brief if available
+        context_path = concept_path
+        if research_path.exists():
+            # Merge concept + research into a single context file for the LLM
+            merged_context_path = Path(session.work_dir) / "_script_context.json"
+            merged = {
+                "concept": concept,
+                "research_brief": json.loads(research_path.read_text()),
+            }
+            merged_context_path.write_text(
+                json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            context_path = merged_context_path
+            self.logger.info("[agent] script generation will use research brief")
+
         self._run_helper([
             "helpers/llm_task.py",
             "--task", "generate_script",
             "--input", str(concept_path),
+            "--context", str(context_path),
             "--duration", str(int(duration)),
             "--output", str(draft_path),
         ], "generate script")
